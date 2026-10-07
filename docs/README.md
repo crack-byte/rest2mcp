@@ -1,69 +1,157 @@
-# REST2MCP
+# Setup and operator flow
 
-REST2MCP is a Rust-based OpenAPI-to-MCP gateway that translates OpenAPI 3.x documents into MCP tool schemas and routes tool calls to backend REST endpoints.
+This guide describes how to build and run the gateway, load an API contract, make a test call, handle a destructive-operation approval, and manage persisted data. The shorter overview is in the [root README](../README.md).
 
-## Goals
+## 1. Build and start locally
 
-- Keep REST API contracts and MCP tool definitions synchronized from a single source of truth
-- Support MCP JSON-RPC over Streamable HTTP and local stdio execution
-- Enforce tool visibility and execution checks based on caller scope
-- Require human confirmation for destructive operations
-- Preserve auditability for all state-changing actions
+Install stable Rust, then run from the project root:
 
-## Project layout
+```sh
+cargo run
+```
 
-- src/main.rs: Application entrypoint and transport selection
-- src/config.rs: Environment and runtime configuration
-- src/mcp.rs: OpenAPI parsing, tool generation, and routing metadata
-- src/security.rs: Caller context, RBAC checks, confirmation tokens, and audit hooks
-- src/openapi.rs: Sample OpenAPI input used for local/dev validation
-- docs/: Project documentation and requirements
+The default HTTP listener is `127.0.0.1:3000`, and the dashboard is enabled. Verify the process:
 
-## Quick start
+```sh
+curl -i http://127.0.0.1:3000/health
+```
 
-1. Install Rust 1.70+.
-2. In the project root, run:
+A healthy response returns HTTP 200 with body `ok`. Open [http://127.0.0.1:3000/](http://127.0.0.1:3000/) for the dashboard.
 
-   cargo run
+Optionally choose a database path and fallback backend before startup:
 
-3. For the HTTP transport, use:
+```sh
+REST2MCP_DB_PATH="$HOME/.local/share/rest2mcp/gateway.sqlite3" \
+REST2MCP_API_BASE_URL="http://127.0.0.1:8080" \
+cargo run
+```
 
-   curl http://127.0.0.1:3000/health
+The parent folder for the SQLite path is created when needed. The database keeps up to 10 saved specs, the active spec name, and up to 1,000 request logs. The default file is `rest2mcp.sqlite3` in the current directory.
 
-4. Post an MCP tool list request to:
+## 2. Load an API contract
 
-   http://127.0.0.1:3000/mcp
+In the dashboard's **OpenAPI Spec Loader**:
 
-Backend calls use the first URL in an OpenAPI 3 document's `servers` list, including its base path. Swagger 2.0 documents use `schemes`, `host`, and `basePath` (HTTPS is assumed if `schemes` is omitted). If neither format specifies a backend URL, the gateway falls back to `REST2MCP_API_BASE_URL` (default: `http://127.0.0.1:8080`). OpenAPI server URL variables use their declared defaults.
+1. Choose a JSON/YAML file or paste the contract into the text area.
+2. Optionally set a name. If blank, a timestamp-based name is generated.
+3. Choose **Validate & Load**.
+4. Check the active schema, backend URL, generated tool list, and tool schemas.
 
-Operation tools retain `operationId` names and map path, query, header, cookie, and JSON body arguments. Required top-level arguments are checked before dispatch, local schema references are expanded, and duplicate generated tool names are rejected. OpenAPI serialization styles and remote `$ref` resolution are not fully supported.
+The first OpenAPI 3 `servers[].url` is used, including its base path. Server URL variable placeholders are replaced with their `default` values. For Swagger 2.0, the URL is assembled from `schemes`, `host`, and `basePath`; HTTPS is assumed when `schemes` is absent. If these fields are absent, the process falls back to `REST2MCP_API_BASE_URL`, defaulting to `http://127.0.0.1:8080`.
 
-## Environment variables
+A spec reload replaces the active tool registry and saves the raw source and resolved backend URL. On process restart, the last active saved spec is restored. This prototype uses the first server only; server selection and per-operation server overrides are not implemented.
 
-- REST2MCP_BIND: bind address, default 0.0.0.0:3000
-- REST2MCP_TRANSPORT: stdio or streamable-http
-- REST2MCP_LOG_TO_STDERR: true/false
-- REST2MCP_ENABLE_UI: true/false, enables the lightweight web dashboard at /ui
-- REST2MCP_API_BASE_URL: fallback API base URL for OpenAPI documents without a `servers` entry
-- REST2MCP_DB_PATH: SQLite database file path, default `rest2mcp.sqlite3` in the working directory
-- REST2MCP_AUTH_TOKEN: optional gateway bearer token; required when binding to a non-loopback address
-- REST2MCP_AUTH_SCOPES: comma-separated scopes granted to that token; defaults to `read:resources`
-- REST2MCP_REQUESTS_PER_MINUTE: process-wide MCP request limit, default `120`
-- REST2MCP_BACKEND_BEARER_TOKEN: optional bearer credential injected into backend requests; tool arguments cannot override it
-- REST2MCP_DUAL_PERSONA: true/false
-- REST2MCP_ALLOW_HUMAN_SSO: true/false
-- REST2MCP_ALLOW_SERVICE_ACCOUNTS: true/false
+## 3. Try a tool in the dashboard
 
-Saved OpenAPI specs, the active schema selection, and recent request logs are stored in SQLite. The dashboard lets you restore or delete saved specs and clear request logs. The database retains up to 10 saved specs and 1,000 request log entries.
+1. In **Manual MCP Tester**, choose a generated tool.
+2. **Generate dummy request** builds an editable request from the available schema examples, defaults, enums, and basic type hints.
+3. Inspect and adjust path, query, header, cookie, and body fields as required by the API.
+4. Choose **Send request**.
+5. Inspect the MCP response and **Recent Request Logs**. Logs include request name, tool, backend URL, outcome, HTTP status, and duration; they intentionally omit request parameters and response bodies.
 
-HTTP defaults to loopback. For remote binding, configure a strong `REST2MCP_AUTH_TOKEN`; remote dashboard mutations additionally require the `admin:write` scope. Set scopes explicitly, for example `read:resources,write:resources,admin:write`, only when needed. The request limit is global to this process, not per identity. The current bearer-token setup is a basic deployment guard, not OAuth/SSO or a replacement for TLS and a production identity provider.
+The backend must be reachable from the gateway process. If a call fails, first check that the active server URL is correct and that the backend is available. Path/query/header/cookie/body mapping supports common cases, but OpenAPI serialization styles, remote `$ref`, and every schema feature are not implemented. Only configured backend bearer tokens are injected automatically; custom auth schemes need additional integration.
 
-## Running tests
+Saved specs have **Load** and **Delete** controls. Load switches the active spec and its backend URL. To delete a spec, load another one first; the active spec cannot be deleted. **Clear logs** removes operational request history from the database.
 
+## 4. Call the HTTP endpoint directly
+
+List tools:
+
+```sh
+curl -sS http://127.0.0.1:3000/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+```
+
+Call the Petstore status search operation (after loading a compatible contract):
+
+```sh
+curl -sS http://127.0.0.1:3000/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"findpetsbystatus","status":"available"}}'
+```
+
+Tool arguments are currently flattened next to `name` in `params`; this differs from clients that nest them under `arguments`. The gateway uses JSON-RPC request IDs and returns JSON-RPC error envelopes for application errors. HTTP transport uses this JSON endpoint; full Streamable HTTP session semantics are not implemented.
+
+## 5. Configure access control
+
+HTTP defaults to loopback. To bind to a non-loopback address, a static gateway token is required:
+
+```sh
+REST2MCP_BIND=0.0.0.0:3000 \
+REST2MCP_AUTH_TOKEN='replace-with-a-long-random-secret' \
+REST2MCP_AUTH_SCOPES='read:resources,write:resources,admin:write' \
+cargo run
+```
+
+Treat the token as a secret: do not put real values in source control or pass production secrets on a shared shell command line. Prefer a protected service manager/secret store. Terminate TLS at a trusted reverse proxy.
+
+For authenticated HTTP requests, send:
+
+```sh
+-H 'Authorization: Bearer <gateway-token>'
+```
+
+`REST2MCP_AUTH_SCOPES` controls the one configured token's scopes. Read tools need `read:resources`; write tools need `write:resources`; destructive tools need `admin:write`. Loading/deleting specs and clearing logs also require `admin:write` when token auth is configured. The default scope is read-only. The request limit (`REST2MCP_REQUESTS_PER_MINUTE`, default `120`) is global to the process rather than per identity.
+
+To attach a backend credential, configure `REST2MCP_BACKEND_BEARER_TOKEN`. It is sent as `Authorization: Bearer ...` to backend APIs and overrides a tool-call-supplied Authorization header. Do not use it when the backend expects a different auth scheme without extending the client.
+
+## 6. Review a destructive operation
+
+A DELETE or Critical-risk tool call does not immediately contact the backend. It returns an `approval_required` result with an expiring approval token. The anonymous local HTTP caller is read-only, so to exercise this flow locally, start the gateway with a temporary token and the required scopes:
+
+```sh
+REST2MCP_AUTH_TOKEN='local-development-secret' \
+REST2MCP_AUTH_SCOPES='read:resources,write:resources,admin:write' \
+cargo run
+```
+
+Enter that token in the dashboard's **Gateway bearer token** field and choose **Use token**. Inspect the displayed method, path, and tool name. If the operation is intended, use the dashboard's **Approve pending action** confirmation or call `tools/approve`:
+
+```sh
+curl -sS http://127.0.0.1:3000/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <gateway-token>' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/approve","params":{"approval_token":"<approval-token>"}}'
+```
+
+Approval is bound to the caller identity, rechecks scopes, expires after five minutes, and is consumed once. Pending approvals are memory-only and become invalid when the gateway restarts. With the configured shared-token mode, caller identity represents that static service token, not a distinct human user; only use the flow in trusted local/development scenarios until real identity integration is added.
+
+## 7. Run as stdio
+
+For a client that launches a local process and speaks line-delimited JSON-RPC on stdio:
+
+```sh
+REST2MCP_TRANSPORT=stdio cargo run
+```
+
+Configure that command and required environment variables in the MCP client's server settings. Stdio mode reads one JSON-RPC message per input line and writes one response per line to stdout; logs go to stderr. The current stdio identity is a local prototype identity, not an externally authenticated principal.
+
+## 8. Tests and cleanup
+
+Run checks:
+
+```sh
 cargo test
+cargo check
+```
 
-## Current status
+To reset locally saved data, stop the gateway and remove the SQLite database file selected by `REST2MCP_DB_PATH` (or the default `rest2mcp.sqlite3`). This deletes saved specs, active selection, and request history. Build output under `target/` is generated and does not need to be committed.
 
-This repository is a production-oriented MVP baseline. It covers the major design points from the requirements document: OpenAPI-derived tool definitions, JSON-RPC routing, read/write scopes, confirmation gating for destructive actions, and request sanitization.
+## Environment variable reference
 
-The next phases would include distributed token storage, real auth providers, OpenTelemetry, and backend HTTP execution against live APIs.
+| Variable | Description | Default |
+| --- | --- | --- |
+| `REST2MCP_BIND` | HTTP listen address | `127.0.0.1:3000` |
+| `REST2MCP_TRANSPORT` | `streamable-http` or `stdio` | `streamable-http` |
+| `REST2MCP_ENABLE_UI` | Enable dashboard | `true` |
+| `REST2MCP_API_BASE_URL` | Fallback URL when spec has no server | `http://127.0.0.1:8080` |
+| `REST2MCP_DB_PATH` | SQLite file | `rest2mcp.sqlite3` |
+| `REST2MCP_AUTH_TOKEN` | Static gateway bearer token; mandatory for remote bind | unset |
+| `REST2MCP_AUTH_SCOPES` | Scopes granted to gateway token | `read:resources` |
+| `REST2MCP_REQUESTS_PER_MINUTE` | Process-wide MCP request limit | `120` |
+| `REST2MCP_BACKEND_BEARER_TOKEN` | Backend bearer credential | unset |
+| `REST2MCP_LOG_TO_STDERR` | Route tracing logs to stderr | `true` |
+| `REST2MCP_DUAL_PERSONA` | Reserved auth configuration flag | `true` |
+| `REST2MCP_ALLOW_HUMAN_SSO` | Reserved auth configuration flag | `true` |
+| `REST2MCP_ALLOW_SERVICE_ACCOUNTS` | Reserved auth configuration flag | `true` |

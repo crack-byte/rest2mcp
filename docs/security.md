@@ -67,3 +67,13 @@ The following are planned for production deployment:
 - append-only audit log persistence
 - Redis-backed approval tokens
 - OpenTelemetry tracing and Prometheus metrics
+
+## Current limitations
+
+- The gateway token is a single static secret; there is no OAuth/OIDC verification, user directory, identity federation, or per-user scope mapping.
+- HTTP uses the gateway's configured scopes, and stdio uses a built-in local prototype identity. Neither is equivalent to validating a real human identity.
+- Rate limiting is in-memory and process-wide. It is not per caller, distributed, or persistent.
+- Backend credential support currently injects a bearer token only; secret rotation and multiple backend auth schemes are not built in.
+- Pending approvals are in-memory and lost on restart. A configured shared token means the approval subject identifies that token, not an individual reviewer.
+- Dashboard and MCP HTTP endpoints should be placed behind TLS and trusted network controls if remotely exposed. Do not treat this baseline as a hardened internet-facing gateway.
+- OpenAPI references and serialization are partial; remote references and all parameter styles are not supported.
