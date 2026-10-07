@@ -90,7 +90,12 @@ impl ToolRegistry {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
 
-                let input_schema = build_input_schema(operation, path, method_name.as_str());
+                let input_schema = build_input_schema(
+                    operation,
+                    path,
+                    method_name.as_str(),
+                    operations.get("parameters"),
+                );
                 let output_schema = build_output_schema(operation);
 
                 tools.push(ToolDefinition {
@@ -157,28 +162,56 @@ fn sanitize_tool_name(value: &str) -> String {
         .to_lowercase()
 }
 
-fn build_input_schema(operation: &Value, path: &str, method: &str) -> Value {
+fn build_input_schema(operation: &Value, path: &str, method: &str, path_parameters: Option<&Value>) -> Value {
     let mut properties = serde_json::Map::new();
     properties.insert("path".to_string(), json!({"type": "string", "description": path}));
     properties.insert("method".to_string(), json!({"type": "string", "enum": [method]}));
+    let mut required = vec!["method".to_string(), "path".to_string()];
 
-    if let Some(parameters) = operation.get("parameters").and_then(Value::as_array) {
-        for parameter in parameters {
-            if let Some(name) = parameter.get("name").and_then(Value::as_str) {
-                let param_type = parameter
-                    .get("schema")
-                    .and_then(|schema| schema.get("type"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("string");
-                properties.insert(name.to_string(), json!({ "type": param_type }));
+    for parameters in [path_parameters, operation.get("parameters")] {
+        if let Some(parameters) = parameters.and_then(Value::as_array) {
+            for parameter in parameters {
+                if let Some(name) = parameter.get("name").and_then(Value::as_str) {
+                    let schema = parameter
+                        .get("schema")
+                        .cloned()
+                        .unwrap_or_else(|| json!({ "type": "string" }));
+                    properties.insert(name.to_string(), schema);
+                    if parameter.get("required").and_then(Value::as_bool).unwrap_or(false)
+                        && !required.iter().any(|required_name| required_name == name)
+                    {
+                        required.push(name.to_string());
+                    }
+                }
             }
+        }
+    }
+
+    let request_body = operation.get("requestBody");
+    let body_schema = request_body
+        .and_then(|body| body.get("content"))
+        .and_then(Value::as_object)
+        .and_then(|content| {
+            content
+                .get("application/json")
+                .or_else(|| content.values().next())
+        })
+        .and_then(|media_type| media_type.get("schema"));
+    if let Some(schema) = body_schema {
+        properties.insert("body".to_string(), schema.clone());
+        if request_body
+            .and_then(|body| body.get("required"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            required.push("body".to_string());
         }
     }
 
     json!({
         "type": "object",
         "properties": properties,
-        "required": ["method", "path"]
+        "required": required
     })
 }
 

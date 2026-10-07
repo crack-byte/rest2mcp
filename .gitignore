@@ -1,2 +1,5 @@
 target/
 Cargo.lock
+rest2mcp.sqlite3
+rest2mcp.sqlite3-shm
+rest2mcp.sqlite3-wal

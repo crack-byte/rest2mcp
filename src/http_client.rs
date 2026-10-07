@@ -1,18 +1,18 @@
-use std::env;
+use std::{env, sync::{Arc, RwLock}};
 
 use reqwest::{Client, Method, Url};
 use serde_json::{json, Map, Value};
 
 #[derive(Debug, Clone)]
 pub struct HttpClient {
-    base_url: String,
+    base_url: Arc<RwLock<String>>,
     client: Client,
 }
 
 impl HttpClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
-            base_url: base_url.into(),
+            base_url: Arc::new(RwLock::new(base_url.into().trim_end_matches('/').to_string())),
             client: Client::new(),
         }
     }
@@ -21,6 +21,26 @@ impl HttpClient {
         let base_url = env::var("REST2MCP_API_BASE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
         Self::new(base_url)
+    }
+
+    pub fn base_url(&self) -> String {
+        self.base_url.read().expect("API base URL lock poisoned").clone()
+    }
+
+    pub fn set_base_url(&self, base_url: &str) -> Result<String, String> {
+        let normalized = base_url.trim().trim_end_matches('/');
+        let parsed = Url::parse(normalized)
+            .map_err(|_| "Enter a valid absolute API URL, such as http://127.0.0.1:8080".to_string())?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err("API base URL must use http:// or https:// and include a host".to_string());
+        }
+        if parsed.query().is_some() || parsed.fragment().is_some() {
+            return Err("API base URL cannot contain a query string or fragment".to_string());
+        }
+
+        let mut current = self.base_url.write().expect("API base URL lock poisoned");
+        *current = normalized.to_string();
+        Ok(current.clone())
     }
 
     pub async fn execute(
@@ -46,9 +66,10 @@ impl HttpClient {
             }
         }
 
+        let base_url = self.base_url();
         let url = format!(
             "{}{}",
-            self.base_url.trim_end_matches('/'),
+            base_url,
             if path.starts_with('/') { path.to_string() } else { format!("/{path}") }
         );
 
@@ -94,7 +115,7 @@ impl HttpClient {
                     continue;
                 }
 
-                if matches!(tool.method.as_str(), "get" | "delete") {
+                if tool.method.eq_ignore_ascii_case("get") || tool.method.eq_ignore_ascii_case("delete") {
                     continue;
                 }
 
@@ -108,7 +129,10 @@ impl HttpClient {
             }
         };
 
-        if !matches!(body, Value::Null) && !matches!(tool.method.as_str(), "get" | "delete") {
+        if !matches!(body, Value::Null)
+            && !tool.method.eq_ignore_ascii_case("get")
+            && !tool.method.eq_ignore_ascii_case("delete")
+        {
             request = request.json(&body);
         }
 

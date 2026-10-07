@@ -1,3 +1,4 @@
+mod storage;
 mod config;
 mod http_client;
 mod mcp;
@@ -6,6 +7,7 @@ mod security;
 
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use axum::{
     extract::State,
@@ -28,11 +30,14 @@ use crate::http_client::HttpClient;
 use crate::mcp::{McpRequest, McpResponse, ToolDefinition, ToolRegistry};
 use crate::openapi::build_registry;
 use crate::security::{AuditEntry, CallerContext, Persona, SecurityGuard};
+use crate::storage::{RuntimeLogEntry, SqliteStore, StoredSpec};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DashboardStatus {
     pub status: String,
     pub transport: String,
+    pub current_spec_name: String,
+    pub api_base_url: String,
     pub tool_count: usize,
     pub risk_counts: serde_json::Value,
     pub health: bool,
@@ -46,6 +51,7 @@ pub struct SpecSummary {
     pub tool_count: usize,
     pub version: String,
     pub updated_at: String,
+    pub api_base_url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,22 +70,14 @@ pub struct SpecLoadResult {
     pub saved_specs: Vec<SpecSummary>,
 }
 
-#[derive(Debug, Clone)]
-struct StoredSpec {
-    name: String,
-    raw: String,
-    tool_count: usize,
-    version: String,
-    updated_at: String,
-}
-
 #[derive(Clone)]
 pub struct GatewayService {
     registry: Arc<RwLock<ToolRegistry>>,
     security: Arc<SecurityGuard>,
     config: Arc<RwLock<GatewayConfig>>,
-    saved_specs: Arc<RwLock<Vec<StoredSpec>>>,
+    store: SqliteStore,
     current_spec_name: Arc<RwLock<String>>,
+    default_api_base_url: String,
     http_client: Arc<HttpClient>,
 }
 
@@ -93,18 +91,53 @@ impl GatewayService {
         config: GatewayConfig,
         http_client: HttpClient,
     ) -> Self {
-        Self {
+        let store = SqliteStore::open_default().expect("SQLite database must be available");
+        Self::from_registry_with_http_client_and_store(registry, config, http_client, store)
+    }
+
+    fn from_registry_with_http_client_and_store(
+        registry: ToolRegistry,
+        config: GatewayConfig,
+        http_client: HttpClient,
+        store: SqliteStore,
+    ) -> Self {
+        let default_api_base_url = http_client.base_url();
+        let service = Self {
             registry: Arc::new(RwLock::new(registry)),
             security: Arc::new(SecurityGuard::default()),
             config: Arc::new(RwLock::new(config)),
-            saved_specs: Arc::new(RwLock::new(Vec::new())),
             current_spec_name: Arc::new(RwLock::new("sample".to_string())),
+            default_api_base_url,
             http_client: Arc::new(http_client),
+            store,
+        };
+        match service.store.active_spec() {
+            Ok(Some(name)) => {
+                if let Err(error) = service.load_saved_spec_by_name(&name) {
+                    tracing::warn!(spec = %name, error = %error, "could not restore active OpenAPI spec from SQLite");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(error = %error, "could not read active OpenAPI spec from SQLite"),
         }
+        service
     }
 
     pub fn registry_snapshot(&self) -> ToolRegistry {
         self.registry.read().expect("registry lock poisoned").clone()
+    }
+
+    pub fn runtime_logs(&self) -> Vec<RuntimeLogEntry> {
+        self.store.recent_logs(100).unwrap_or_else(|error| {
+            tracing::error!(error = %error, "failed to load runtime logs from SQLite");
+            Vec::new()
+        })
+    }
+
+    fn push_runtime_log(&self, entry: RuntimeLogEntry) {
+        if let Err(error) = self.store.add_log(&entry) {
+            tracing::error!(error = %error, "failed to persist runtime log to SQLite");
+        }
     }
 
     pub fn config(&self) -> GatewayConfig {
@@ -112,27 +145,35 @@ impl GatewayService {
     }
 
     pub fn list_saved_specs(&self) -> Vec<SpecSummary> {
-        self.saved_specs
-            .read()
-            .expect("saved specs lock poisoned")
+        self.store.list_specs().unwrap_or_else(|error| {
+            tracing::error!(error = %error, "failed to load saved specs from SQLite");
+            Vec::new()
+        })
             .iter()
             .map(|entry| SpecSummary {
                 name: entry.name.clone(),
                 tool_count: entry.tool_count,
                 version: entry.version.clone(),
                 updated_at: entry.updated_at.clone(),
+                api_base_url: entry.api_base_url.clone(),
             })
             .collect()
     }
 
+    pub fn delete_saved_spec(&self, name: &str) -> Result<bool, String> {
+        let is_active = self.current_spec_name.read().expect("current spec name lock poisoned").as_str() == name;
+        if is_active {
+            return Err("Load another schema before deleting the active one".to_string());
+        }
+        self.store.delete_spec(name).map_err(|error| error.to_string())
+    }
+
+    pub fn clear_runtime_logs(&self) -> Result<usize, String> {
+        self.store.clear_logs().map_err(|error| error.to_string())
+    }
+
     pub fn load_saved_spec_by_name(&self, name: &str) -> Result<SpecLoadResult, String> {
-        let stored = self
-            .saved_specs
-            .read()
-            .expect("saved specs lock poisoned")
-            .iter()
-            .find(|entry| entry.name == name)
-            .cloned()
+        let stored = self.store.get_spec(name).map_err(|error| error.to_string())?
             .ok_or_else(|| format!("saved spec '{name}' was not found"))?;
 
         let parsed = parse_openapi_document(&stored.raw)?;
@@ -169,6 +210,9 @@ impl GatewayService {
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("spec-{}", Utc::now().format("%Y%m%d-%H%M%S")));
 
+        let api_base_url = openapi_server_url(spec)?.unwrap_or_else(|| self.default_api_base_url.clone());
+        let api_base_url = self.http_client.set_base_url(&api_base_url)?;
+
         let updated_at = Utc::now().to_rfc3339();
         let saved_record = StoredSpec {
             name: name.clone(),
@@ -176,27 +220,25 @@ impl GatewayService {
             tool_count: next.list().len(),
             version: version.clone(),
             updated_at: updated_at.clone(),
+            api_base_url,
         };
 
-        let mut saved_specs = self.saved_specs.write().expect("saved specs lock poisoned");
-        if let Some(index) = saved_specs.iter().position(|entry| entry.name == name) {
-            saved_specs.remove(index);
-        }
-        saved_specs.insert(0, saved_record);
-        saved_specs.truncate(10);
+        self.store.save_spec(&saved_record).map_err(|error| error.to_string())?;
+        self.store.set_active_spec(&name).map_err(|error| error.to_string())?;
         *self.current_spec_name.write().expect("current spec name lock poisoned") = name.clone();
 
         let next_tool_count = next.list().len();
         let mut registry = self.registry.write().expect("registry lock poisoned");
         *registry = next;
 
-        let summaries = saved_specs
+        let summaries = self.store.list_specs().map_err(|error| error.to_string())?
             .iter()
             .map(|entry| SpecSummary {
                 name: entry.name.clone(),
                 tool_count: entry.tool_count,
                 version: entry.version.clone(),
                 updated_at: entry.updated_at.clone(),
+                api_base_url: entry.api_base_url.clone(),
             })
             .collect();
 
@@ -232,6 +274,8 @@ impl GatewayService {
         DashboardStatus {
             status: "healthy".to_string(),
             transport: config.transport.to_string(),
+            current_spec_name: self.current_spec_name.read().expect("current spec name lock poisoned").clone(),
+            api_base_url: self.http_client.base_url(),
             tool_count,
             risk_counts: serde_json::Value::Object(risk_counts),
             health: true,
@@ -257,6 +301,66 @@ impl GatewayService {
     }
 
     pub async fn handle_request(&self, request: &McpRequest, caller: &CallerContext) -> Result<McpResponse, String> {
+        let started = Instant::now();
+        let tool_name = request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let tool = self
+            .registry
+            .read()
+            .expect("registry lock poisoned")
+            .find_by_name(&tool_name)
+            .cloned();
+        let backend = tool
+            .as_ref()
+            .map(|tool| format!("{}{}", self.http_client.base_url(), tool.path))
+            .unwrap_or_else(|| "-".to_string());
+
+        let result = self.handle_request_inner(request, caller).await;
+        let (outcome, http_status) = match &result {
+            Ok(response) => {
+                let result = &response.result;
+                let outcome = result
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("success")
+                    .to_string();
+                let status = result
+                    .get("http_response")
+                    .and_then(|response| response.get("status"))
+                    .and_then(Value::as_u64)
+                    .and_then(|status| u16::try_from(status).ok());
+                (outcome, status)
+            }
+            Err(_) => ("failed".to_string(), None),
+        };
+
+        let entry = RuntimeLogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            request: request.method.clone(),
+            tool: tool_name,
+            backend,
+            outcome: outcome.clone(),
+            http_status,
+            duration_ms: started.elapsed().as_millis(),
+        };
+        tracing::info!(
+            request = %entry.request,
+            tool = %entry.tool,
+            outcome = %entry.outcome,
+            http_status = ?entry.http_status,
+            duration_ms = entry.duration_ms,
+            "MCP request completed"
+        );
+        self.push_runtime_log(entry);
+        result
+    }
+
+    async fn handle_request_inner(&self, request: &McpRequest, caller: &CallerContext) -> Result<McpResponse, String> {
         let fragmentation_check = vec![
             request.method.clone(),
             request.id.to_string(),
@@ -359,6 +463,63 @@ fn parse_openapi_document(raw: &str) -> Result<Value, String> {
         .map_err(|err| format!("OpenAPI content is not valid JSON or YAML: {err}"))
 }
 
+fn openapi_server_url(spec: &Value) -> Result<Option<String>, String> {
+    if let Some(server) = spec
+        .get("servers")
+        .and_then(Value::as_array)
+        .and_then(|servers| servers.first())
+    {
+        let mut url = server
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "The first OpenAPI server must define a URL".to_string())?
+            .to_string();
+
+        if let Some(variables) = server.get("variables").and_then(Value::as_object) {
+            for (name, variable) in variables {
+                let default = variable
+                    .get("default")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("OpenAPI server variable '{name}' must define a string default"))?;
+                url = url.replace(&format!("{{{name}}}"), default);
+            }
+        }
+
+        if url.contains('{') || url.contains('}') {
+            return Err(format!("OpenAPI server URL contains an unresolved variable: {url}"));
+        }
+
+        return Ok(Some(url));
+    }
+
+    // Swagger 2.0 describes its endpoint as separate host, basePath, and schemes fields.
+    if let Some(host) = spec.get("host").and_then(Value::as_str).filter(|host| !host.trim().is_empty()) {
+        let scheme = spec
+            .get("schemes")
+            .and_then(Value::as_array)
+            .and_then(|schemes| schemes.first())
+            .and_then(Value::as_str)
+            .unwrap_or("https");
+        if !matches!(scheme, "http" | "https") {
+            return Err(format!("Unsupported Swagger scheme '{scheme}'; expected http or https"));
+        }
+
+        let base_path = spec
+            .get("basePath")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim_matches('/');
+        let base_path = if base_path.is_empty() {
+            String::new()
+        } else {
+            format!("/{base_path}")
+        };
+        return Ok(Some(format!("{scheme}://{}{base_path}", host.trim().trim_end_matches('/'))));
+    }
+
+    Ok(None)
+}
+
 async fn health() -> &'static str {
     "ok"
 }
@@ -407,10 +568,12 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
             .iter()
             .map(|spec| {
                 format!(
-                    "<li style=\"display:flex; justify-content:space-between; align-items:center; gap:12px; padding:8px 0; border-bottom: 1px solid var(--line);\"><div><strong>{}</strong><div class=\"meta\">{} tools · {}</div></div><button class=\"secondary\" data-load-spec=\"{}\" type=\"button\">Load</button></li>",
+                    "<li style=\"display:flex; justify-content:space-between; align-items:center; gap:12px; padding:8px 0; border-bottom: 1px solid var(--line);\"><div><strong>{}</strong><div class=\"meta\">{} tools · {} · {}</div></div><div style=\"display:flex; gap:8px;\"><button class=\"secondary\" data-load-spec=\"{}\" type=\"button\">Load</button><button class=\"secondary\" data-delete-spec=\"{}\" type=\"button\">Delete</button></div></li>",
                     spec.name,
                     spec.tool_count,
                     spec.version,
+                    spec.api_base_url,
+                    spec.name,
                     spec.name
                 )
             })
@@ -447,6 +610,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
               .success {{ background: rgba(52,211,153,.12); color: #a7f3d0; border: 1px solid rgba(52,211,153,.45); }}
               .meta {{ color: var(--muted); margin-top: 6px; }}
               textarea {{ width: 100%; min-height: 220px; margin-top: 18px; background: rgba(15,23,42,.9); color: var(--text); border: 1px solid var(--line); border-radius: 12px; padding: 16px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical; }}
+              select {{ width: 100%; margin-top: 8px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: rgba(15,23,42,.9); color: var(--text); }}
               input[type="file"] {{ margin-top: 10px; color: var(--muted); }}
               .status-box {{ margin-top: 12px; min-height: 24px; color: var(--muted); }}
               ul {{ list-style: none; padding: 0; margin: 12px 0 0; }}
@@ -486,6 +650,11 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                   <div class="value" id="uiStatusValue">{}</div>
                   <div class="meta">Dashboard enabled</div>
                 </div>
+                                <div class="card">
+                                    <div class="label">Active schema</div>
+                                    <div class="value" id="activeSchemaValue" style="font-size:1.25rem; overflow-wrap:anywhere;">{}</div>
+                                    <div class="meta" id="activeApiUrl"></div>
+                                </div>
               </div>
 
               <div class="panel">
@@ -546,6 +715,44 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                 <div class="meta" id="selectedToolMeta">Select a tool to inspect input/output schema.</div>
                 <pre id="selectedToolSchema">{}</pre>
               </div>
+
+                            <div class="panel" style="margin-top: 24px;">
+                                <h2 style="margin: 0 0 8px;">Manual MCP Tester</h2>
+                                <div class="meta">Generate editable dummy inputs from the OpenAPI schema, then send JSON-RPC requests to this gateway's <code>/mcp</code> endpoint.</div>
+                                <label class="meta" for="testToolSelect">Tool for a quick call</label>
+                                <select id="testToolSelect"></select>
+                                <label class="meta" for="mcpRequestInput" style="display:block; margin-top:16px;">JSON-RPC request (editable)</label>
+                                <textarea id="mcpRequestInput" spellcheck="false" style="min-height: 180px;"></textarea>
+                                <div class="controls">
+                                    <button class="secondary" id="listToolsBtn" type="button">Test tools/list</button>
+                                    <button class="secondary" id="prepareToolCallBtn" type="button">Generate dummy request</button>
+                                    <button class="primary" id="sendMcpRequestBtn" type="button">Send request</button>
+                                </div>
+                                <div class="status-box" id="mcpTestStatus" role="status">Ready. Select a tool or test tools/list.</div>
+                                <h3 style="margin-bottom:8px;">Response</h3>
+                                <pre id="mcpTestResponse">No request sent yet.</pre>
+                            </div>
+
+                            <div class="panel" style="margin-top: 24px;">
+                                <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+                                    <div>
+                                        <h2 style="margin: 0 0 8px;">Recent Request Logs</h2>
+                                        <div class="meta">Latest 100 MCP requests. Payloads and response bodies are intentionally excluded.</div>
+                                    </div>
+                                    <div style="display:flex; gap:8px;">
+                                        <button class="secondary" id="refreshLogsBtn" type="button">Refresh logs</button>
+                                        <button class="secondary" id="clearLogsBtn" type="button">Clear logs</button>
+                                    </div>
+                                </div>
+                                <div style="overflow-x:auto;">
+                                    <table>
+                                        <thead>
+                                            <tr><th>Time</th><th>Request</th><th>Tool</th><th>Backend</th><th>Outcome</th><th>HTTP</th><th>Duration</th></tr>
+                                        </thead>
+                                        <tbody id="runtimeLogsBody"><tr><td colspan="7" class="meta">No requests logged yet.</td></tr></tbody>
+                                    </table>
+                                </div>
+                            </div>
             </div>
 
                         <script>
@@ -561,6 +768,8 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                 document.getElementById('transportValue').textContent = payload.transport;
                 document.getElementById('uiStatusValue').textContent = payload.ui_enabled ? 'Enabled' : 'Disabled';
                 document.getElementById('updatedAt').textContent = 'Updated: ' + payload.last_updated;
+                document.getElementById('activeSchemaValue').textContent = payload.current_spec_name;
+                document.getElementById('activeApiUrl').textContent = payload.api_base_url;
               }};
 
               const showToolSchema = (name) => {{
@@ -581,6 +790,112 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                 }}, null, 2);
               }};
 
+                            const setMcpRequest = (request) => {{
+                                document.getElementById('mcpRequestInput').value = JSON.stringify(request, null, 2);
+                            }};
+
+                            const dummyValue = (schema = {{}}, name = 'value', depth = 0) => {{
+                                if (depth > 6) return null;
+                                if (schema.example !== undefined) return schema.example;
+                                if (schema.default !== undefined) return schema.default;
+                                if (Array.isArray(schema.enum) && schema.enum.length) return schema.enum[0];
+                                if (Array.isArray(schema.oneOf) && schema.oneOf.length) return dummyValue(schema.oneOf[0], name, depth + 1);
+                                if (Array.isArray(schema.anyOf) && schema.anyOf.length) return dummyValue(schema.anyOf[0], name, depth + 1);
+
+                                const type = Array.isArray(schema.type) ? schema.type[0] : schema.type;
+                                if (type === 'object' || schema.properties) {{
+                                    const properties = schema.properties || {{}};
+                                    return Object.fromEntries(Object.entries(properties).map(([key, value]) => [key, dummyValue(value, key, depth + 1)]));
+                                }}
+                                if (type === 'array') return [dummyValue(schema.items || {{ type: 'string' }}, name, depth + 1)];
+                                if (type === 'integer' || type === 'number') return schema.minimum ?? 1;
+                                if (type === 'boolean') return false;
+
+                                const key = name.toLowerCase();
+                                if (schema.format === 'email' || key.includes('email')) return 'demo@example.com';
+                                if (schema.format === 'date') return '2026-01-15';
+                                if (schema.format === 'date-time') return '2026-01-15T12:00:00Z';
+                                if (key === 'id' || key.endsWith('_id')) return '123';
+                                if (key.includes('name')) return 'Example';
+                                if (key.includes('status')) return 'active';
+                                const minLength = Math.min(schema.minLength || 0, 32);
+                                return minLength > 0 ? 'x'.repeat(minLength) : 'sample';
+                            }};
+
+                            const prepareSelectedToolCall = () => {{
+                                const name = document.getElementById('testToolSelect').value;
+                                const tool = toolSchemas[name];
+                                if (!tool) {{
+                                    return;
+                                }}
+
+                                const params = {{ name: tool.name }};
+                                const properties = (tool.input_schema && tool.input_schema.properties) || {{}};
+                                Object.entries(properties).forEach(([key, schema]) => {{
+                                    if (key !== 'method' && key !== 'path') {{
+                                        params[key] = dummyValue(schema, key);
+                                    }}
+                                }});
+                                const pathParams = tool.path.split('/').filter((segment) => segment.startsWith('{{') && segment.endsWith('}}'));
+                                pathParams.forEach((placeholder) => {{
+                                    const key = placeholder.slice(1, -1);
+                                    if (params[key] === undefined) params[key] = dummyValue({{ type: 'string' }}, key);
+                                }});
+                                if (['POST', 'PUT', 'PATCH'].includes(tool.method) && params.body === undefined) {{
+                                    params.body = {{}};
+                                }}
+                                setMcpRequest({{ jsonrpc: '2.0', id: 1, method: 'tools/call', params }});
+                            }};
+
+                            const sendMcpRequest = async () => {{
+                                const status = document.getElementById('mcpTestStatus');
+                                const output = document.getElementById('mcpTestResponse');
+                                let request;
+                                try {{
+                                    request = JSON.parse(document.getElementById('mcpRequestInput').value);
+                                }} catch (err) {{
+                                    status.textContent = 'Invalid JSON: ' + err.message;
+                                    status.style.color = '#fca5a5';
+                                    return;
+                                }}
+
+                                status.textContent = 'Sending request…';
+                                status.style.color = 'var(--muted)';
+                                output.textContent = 'Waiting for gateway response…';
+                                try {{
+                                    const response = await fetch('/mcp', {{
+                                        method: 'POST',
+                                        headers: {{ 'Content-Type': 'application/json' }},
+                                        body: JSON.stringify(request)
+                                    }});
+                                    const text = await response.text();
+                                    let payload;
+                                    try {{ payload = JSON.parse(text); }} catch (_) {{ payload = text || '(empty response body)'; }}
+                                    output.textContent = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+                                    status.textContent = 'HTTP ' + response.status + (response.ok ? ' · request completed' : ' · request failed');
+                                    status.style.color = response.ok ? '#a7f3d0' : '#fca5a5';
+                                }} catch (err) {{
+                                    output.textContent = err.message;
+                                    status.textContent = 'Request failed';
+                                    status.style.color = '#fca5a5';
+                                }}
+                            }};
+
+                            const testToolSelect = document.getElementById('testToolSelect');
+                            toolSchemaEntries.forEach((tool) => {{
+                                const option = document.createElement('option');
+                                option.value = tool.name;
+                                option.textContent = tool.name + ' · ' + tool.method + ' ' + tool.path;
+                                testToolSelect.appendChild(option);
+                            }});
+                            document.getElementById('listToolsBtn').addEventListener('click', () => {{
+                                setMcpRequest({{ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {{}} }});
+                                sendMcpRequest();
+                            }});
+                            document.getElementById('prepareToolCallBtn').addEventListener('click', prepareSelectedToolCall);
+                            document.getElementById('sendMcpRequestBtn').addEventListener('click', sendMcpRequest);
+                            testToolSelect.addEventListener('change', prepareSelectedToolCall);
+
               const setSpecStatus = (message, ok = true) => {{
                 const node = document.getElementById('specStatus');
                 node.textContent = message;
@@ -592,6 +907,77 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                 const payload = await response.json();
                 render(payload);
               }};
+
+                            const refreshLogs = async () => {{
+                                const tbody = document.getElementById('runtimeLogsBody');
+                                try {{
+                                    const response = await fetch('/ui/logs');
+                                    if (!response.ok) throw new Error('Unable to load logs');
+                                    const logs = await response.json();
+                                    tbody.replaceChildren();
+                                    if (!logs.length) {{
+                                        const row = tbody.insertRow();
+                                        const cell = row.insertCell();
+                                        cell.colSpan = 7;
+                                        cell.className = 'meta';
+                                        cell.textContent = 'No requests logged yet.';
+                                        return;
+                                    }}
+
+                                    logs.forEach((entry) => {{
+                                        const row = tbody.insertRow();
+                                        const values = [
+                                            new Date(entry.timestamp).toLocaleTimeString(),
+                                            entry.request,
+                                            entry.tool,
+                                            entry.backend,
+                                            entry.outcome,
+                                            entry.http_status ?? '—',
+                                            entry.duration_ms + ' ms'
+                                        ];
+                                        values.forEach((value) => {{
+                                            const cell = row.insertCell();
+                                            cell.textContent = String(value);
+                                        }});
+                                    }});
+                                }} catch (err) {{
+                                    tbody.replaceChildren();
+                                    const row = tbody.insertRow();
+                                    const cell = row.insertCell();
+                                    cell.colSpan = 7;
+                                    cell.className = 'meta';
+                                    cell.textContent = err.message;
+                                }}
+                            }};
+                            document.getElementById('refreshLogsBtn').addEventListener('click', refreshLogs);
+                            document.getElementById('clearLogsBtn').addEventListener('click', async () => {{
+                                if (!window.confirm('Permanently clear all stored request logs?')) return;
+                                const response = await fetch('/ui/logs/clear', {{ method: 'POST' }});
+                                const payload = await response.json();
+                                if (!response.ok) {{
+                                    window.alert(payload.error || 'Unable to clear logs.');
+                                    return;
+                                }}
+                                refreshLogs();
+                            }});
+
+                            document.querySelectorAll('[data-delete-spec]').forEach((button) => {{
+                                button.addEventListener('click', async () => {{
+                                    const name = button.getAttribute('data-delete-spec');
+                                    if (!window.confirm('Delete saved schema "' + name + '"?')) return;
+                                    const response = await fetch('/ui/spec/delete', {{
+                                        method: 'POST',
+                                        headers: {{ 'Content-Type': 'application/json' }},
+                                        body: JSON.stringify({{ name }})
+                                    }});
+                                    const payload = await response.json();
+                                    if (!response.ok) {{
+                                        setSpecStatus(payload.error || 'Unable to delete saved schema.', false);
+                                        return;
+                                    }}
+                                    window.location.reload();
+                                }});
+                            }});
 
               const loadSpec = async () => {{
                 const raw = document.getElementById('specInput').value.trim();
@@ -693,10 +1079,14 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
               const firstTool = Object.keys(toolSchemas)[0];
               if (firstTool) {{
                 showToolSchema(firstTool);
+                                testToolSelect.value = firstTool;
+                                prepareSelectedToolCall();
               }}
 
               refresh();
+              refreshLogs();
               setInterval(refresh, 5000);
+              setInterval(refreshLogs, 3000);
             </script>
           </body>
         </html>
@@ -706,6 +1096,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
         status.tool_count,
         status.transport,
         if status.ui_enabled { "Enabled" } else { "Disabled" },
+        status.current_spec_name,
         status.last_updated,
         saved_specs_rows,
         tool_rows,
@@ -716,6 +1107,48 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
 
 async fn ui_status(State(state): State<GatewayService>) -> Json<DashboardStatus> {
     Json(state.status_snapshot())
+}
+
+async fn ui_logs(State(state): State<GatewayService>) -> Json<Vec<RuntimeLogEntry>> {
+    Json(state.runtime_logs())
+}
+
+async fn ui_clear_logs(
+    State(state): State<GatewayService>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    state
+        .clear_runtime_logs()
+        .map(|deleted| Json(json!({ "ok": true, "deleted": deleted })))
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "ok": false, "error": error })),
+            )
+        })
+}
+
+async fn ui_delete_spec(
+    State(state): State<GatewayService>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": "spec name is required" })),
+            )
+        })?;
+    state
+        .delete_saved_spec(name)
+        .map(|deleted| Json(json!({ "ok": true, "deleted": deleted })))
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": error })),
+            )
+        })
 }
 
 async fn ui_set_mode(
@@ -792,12 +1225,15 @@ async fn ui_restore_spec(
     })?;
 
     let raw = state
-        .saved_specs
-        .read()
-        .expect("saved specs lock poisoned")
-        .iter()
-        .find(|entry| entry.name == result.saved_name)
-        .map(|entry| entry.raw.clone())
+        .store
+        .get_spec(&result.saved_name)
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "ok": false, "error": error.to_string() })),
+            )
+        })?
+        .map(|entry| entry.raw)
         .unwrap_or_default();
 
     Ok(Json(json!({
@@ -912,8 +1348,11 @@ async fn main() {
         app = app
             .route("/ui", get(ui_page))
             .route("/ui/status", get(ui_status))
+            .route("/ui/logs", get(ui_logs))
+            .route("/ui/logs/clear", post(ui_clear_logs))
             .route("/ui/mode", post(ui_set_mode))
             .route("/ui/spec", post(ui_load_spec))
+            .route("/ui/spec/delete", post(ui_delete_spec))
             .route("/ui/spec/restore", post(ui_restore_spec))
             .route("/", get(ui_page));
     }
@@ -937,8 +1376,12 @@ mod tests {
     use serde_json::json;
 
     use crate::config::GatewayConfig;
+    use crate::http_client::HttpClient;
     use crate::mcp::ToolRegistry;
+    use crate::openapi::build_registry;
     use crate::security::{CallerContext, Persona, SecurityGuard};
+    use crate::storage::SqliteStore;
+    use crate::GatewayService;
 
     #[test]
     fn generates_mcp_tools_from_openapi() {
@@ -962,6 +1405,209 @@ mod tests {
         assert!(names.contains(&"get_invoices".to_string()));
         assert!(names.contains(&"post_invoices".to_string()));
         assert!(names.contains(&"delete_invoices_id".to_string()));
+    }
+
+    #[test]
+    fn preserves_openapi_examples_for_dashboard_dummy_inputs() {
+        let registry = crate::openapi::build_registry().expect("sample OpenAPI document should parse");
+        let tools = registry.list();
+
+        let list_schema = &registry
+            .find_by_name("get_invoices")
+            .expect("list invoices tool should exist")
+            .input_schema;
+        assert_eq!(list_schema["properties"]["status"]["example"], "open");
+        assert_eq!(list_schema["properties"]["limit"]["example"], 10);
+
+        let fetch_schema = &registry
+            .find_by_name("get_invoices_id")
+            .expect("fetch invoice tool should exist")
+            .input_schema;
+        assert_eq!(fetch_schema["properties"]["id"]["example"], 123);
+
+        let create_schema = &registry
+            .find_by_name("post_invoices")
+            .expect("create invoice tool should exist")
+            .input_schema;
+        assert_eq!(create_schema["properties"]["body"]["properties"]["customer"]["example"], "Acme Corp");
+        assert_eq!(create_schema["properties"]["body"]["properties"]["amount"]["example"], 125.5);
+        assert!(create_schema["required"].as_array().unwrap().contains(&json!("body")));
+        assert_eq!(tools.len(), 4);
+    }
+
+    #[test]
+    fn derives_api_url_from_swagger_host_and_base_path() {
+        let swagger = json!({
+            "swagger": "2.0",
+            "host": "petstore.swagger.io",
+            "basePath": "/v2",
+            "schemes": ["https", "http"],
+            "paths": {}
+        });
+        assert_eq!(crate::openapi_server_url(&swagger).unwrap().as_deref(), Some("https://petstore.swagger.io/v2"));
+
+        let swagger_without_scheme = json!({
+            "swagger": "2.0",
+            "host": "petstore.swagger.io",
+            "basePath": "/v2",
+            "paths": {}
+        });
+        assert_eq!(crate::openapi_server_url(&swagger_without_scheme).unwrap().as_deref(), Some("https://petstore.swagger.io/v2"));
+    }
+
+    #[test]
+    fn updates_and_validates_backend_api_base_url() {
+        let http_client = HttpClient::new("http://127.0.0.1:8080");
+        let cloned_client = http_client.clone();
+
+        assert_eq!(http_client.base_url(), "http://127.0.0.1:8080");
+        assert_eq!(
+            http_client.set_base_url(" https://api.example.test/v1/ ").unwrap(),
+            "https://api.example.test/v1"
+        );
+        assert_eq!(cloned_client.base_url(), "https://api.example.test/v1");
+        assert!(http_client.set_base_url("ftp://api.example.test").is_err());
+        assert!(http_client.set_base_url("https://api.example.test/v1?token=secret").is_err());
+
+        let service = GatewayService::from_registry_with_http_client(
+            build_registry().expect("sample OpenAPI document should parse"),
+            GatewayConfig::default(),
+            http_client,
+        );
+        assert_eq!(service.status_snapshot().api_base_url, "https://api.example.test/v1");
+    }
+
+    #[test]
+    fn restores_the_api_base_url_associated_with_each_saved_spec() {
+        let service = GatewayService::from_registry_with_http_client(
+            build_registry().expect("sample OpenAPI document should parse"),
+            GatewayConfig::default(),
+            HttpClient::new("http://default.example.test"),
+        );
+        let spec_a = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "Pets API", "version": "1.0" },
+            "servers": [{ "url": "https://pets.example.test/api/v1" }],
+            "paths": { "/pets": { "get": { "responses": { "200": { "description": "ok" } } } } }
+        });
+        let spec_b = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "Orders API", "version": "1.0" },
+            "servers": [{ "url": "https://orders.example.test/v2" }],
+            "paths": { "/orders": { "get": { "responses": { "200": { "description": "ok" } } } } }
+        });
+
+        service.load_openapi_spec(&spec_a, Some("pets")).unwrap();
+        assert_eq!(service.status_snapshot().api_base_url, "https://pets.example.test/api/v1");
+        service.load_openapi_spec(&spec_b, Some("orders")).unwrap();
+        assert_eq!(service.status_snapshot().api_base_url, "https://orders.example.test/v2");
+
+        service.load_saved_spec_by_name("pets").unwrap();
+        assert_eq!(service.status_snapshot().current_spec_name, "pets");
+        assert_eq!(service.status_snapshot().api_base_url, "https://pets.example.test/api/v1");
+        service.load_saved_spec_by_name("orders").unwrap();
+        assert_eq!(service.status_snapshot().current_spec_name, "orders");
+        assert_eq!(service.status_snapshot().api_base_url, "https://orders.example.test/v2");
+
+        let saved = service.list_saved_specs();
+        assert_eq!(saved.iter().find(|spec| spec.name == "pets").unwrap().api_base_url, "https://pets.example.test/api/v1");
+        assert_eq!(saved.iter().find(|spec| spec.name == "orders").unwrap().api_base_url, "https://orders.example.test/v2");
+    }
+
+    #[tokio::test]
+    async fn records_recent_mcp_requests_without_logging_payloads() {
+        let service = GatewayService::from_registry_with_http_client(
+            build_registry().expect("sample OpenAPI document should parse"),
+            GatewayConfig::default(),
+            HttpClient::new("http://backend.example.test"),
+        );
+        let caller = CallerContext {
+            persona: Persona::Human,
+            subject: "test-user".to_string(),
+            scopes: vec!["read:resources".to_string()],
+        };
+        let request = crate::mcp::McpRequest {
+            jsonrpc: "2.0".to_string(),
+            id: json!(1),
+            method: "tools/list".to_string(),
+            params: Some(json!({ "private_payload": "must not be logged" })),
+        };
+
+        service.handle_request(&request, &caller).await.expect("tools/list should succeed");
+        for id in 2..=105 {
+            let mut request = request.clone();
+            request.id = json!(id);
+            service.handle_request(&request, &caller).await.expect("tools/list should succeed");
+        }
+
+        let logs = service.runtime_logs();
+        assert_eq!(logs.len(), 100);
+        assert_eq!(logs[0].request, "tools/list");
+        assert_eq!(logs[0].outcome, "success");
+        assert_eq!(logs[0].tool, "-");
+        assert_eq!(logs[0].backend, "-");
+        assert!(!serde_json::to_string(&logs).unwrap().contains("must not be logged"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_persists_specs_active_selection_and_logs() {
+        let db_path = std::env::temp_dir().join(format!("rest2mcp-{}.sqlite3", uuid::Uuid::new_v4()));
+        let store = SqliteStore::open(&db_path).expect("test SQLite database should open");
+        let service = GatewayService::from_registry_with_http_client_and_store(
+            build_registry().expect("sample OpenAPI document should parse"),
+            GatewayConfig::default(),
+            HttpClient::new("http://fallback.example.test"),
+            store.clone(),
+        );
+        let first_spec = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "First API", "version": "1" },
+            "servers": [{ "url": "https://first.example.test/api" }],
+            "paths": { "/first": { "get": { "responses": { "200": { "description": "ok" } } } } }
+        });
+        let active_spec = json!({
+            "swagger": "2.0",
+            "info": { "title": "Active API", "version": "2" },
+            "host": "active.example.test",
+            "basePath": "/v2",
+            "schemes": ["https"],
+            "paths": { "/active": { "get": { "responses": { "200": { "description": "ok" } } } } }
+        });
+        service.load_openapi_spec(&first_spec, Some("first")).unwrap();
+        service.load_openapi_spec(&active_spec, Some("active")).unwrap();
+        let caller = CallerContext {
+            persona: Persona::Human,
+            subject: "persist-test".to_string(),
+            scopes: vec!["read:resources".to_string()],
+        };
+        service.handle_request(&crate::mcp::McpRequest {
+            jsonrpc: "2.0".to_string(),
+            id: json!(1),
+            method: "tools/list".to_string(),
+            params: Some(json!({})),
+        }, &caller).await.unwrap();
+        assert!(service.delete_saved_spec("first").unwrap());
+        drop(service);
+        drop(store);
+
+        let reopened_store = SqliteStore::open(&db_path).expect("database should reopen");
+        let reopened = GatewayService::from_registry_with_http_client_and_store(
+            build_registry().expect("sample OpenAPI document should parse"),
+            GatewayConfig::default(),
+            HttpClient::new("http://fallback.example.test"),
+            reopened_store.clone(),
+        );
+        assert_eq!(reopened.status_snapshot().current_spec_name, "active");
+        assert_eq!(reopened.status_snapshot().api_base_url, "https://active.example.test/v2");
+        assert_eq!(reopened.registry_snapshot().list()[0].path, "/active");
+        assert_eq!(reopened.list_saved_specs().len(), 1);
+        assert_eq!(reopened.runtime_logs().len(), 1);
+        assert_eq!(reopened.clear_runtime_logs().unwrap(), 1);
+        assert!(reopened.runtime_logs().is_empty());
+
+        drop(reopened);
+        drop(reopened_store);
+        std::fs::remove_file(db_path).expect("temporary database should be removed");
     }
 
     #[test]
