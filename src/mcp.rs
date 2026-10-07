@@ -60,7 +60,7 @@ impl ToolRegistry {
                 .ok_or_else(|| format!("OpenAPI path '{path}' does not map to an object"))?;
 
             for (method_name, operation) in operations {
-                if !matches!(method_name.as_str(), "get" | "post" | "put" | "patch" | "delete") {
+                if !matches!(method_name.as_str(), "get" | "post" | "put" | "patch" | "delete" | "head" | "options") {
                     continue;
                 }
 
@@ -95,8 +95,9 @@ impl ToolRegistry {
                     path,
                     method_name.as_str(),
                     operations.get("parameters"),
+                    spec,
                 );
-                let output_schema = build_output_schema(operation);
+                let output_schema = build_output_schema(operation, spec);
 
                 tools.push(ToolDefinition {
                     name: tool_name,
@@ -114,6 +115,11 @@ impl ToolRegistry {
         }
 
         tools.sort_by(|left, right| left.name.cmp(&right.name));
+        for pair in tools.windows(2) {
+            if pair[0].name == pair[1].name {
+                return Err(format!("OpenAPI operations generate duplicate MCP tool name '{}'", pair[0].name));
+            }
+        }
 
         Ok(Self { tools })
     }
@@ -162,7 +168,13 @@ fn sanitize_tool_name(value: &str) -> String {
         .to_lowercase()
 }
 
-fn build_input_schema(operation: &Value, path: &str, method: &str, path_parameters: Option<&Value>) -> Value {
+fn build_input_schema(
+    operation: &Value,
+    path: &str,
+    method: &str,
+    path_parameters: Option<&Value>,
+    spec: &Value,
+) -> Value {
     let mut properties = serde_json::Map::new();
     properties.insert("path".to_string(), json!({"type": "string", "description": path}));
     properties.insert("method".to_string(), json!({"type": "string", "enum": [method]}));
@@ -171,11 +183,31 @@ fn build_input_schema(operation: &Value, path: &str, method: &str, path_paramete
     for parameters in [path_parameters, operation.get("parameters")] {
         if let Some(parameters) = parameters.and_then(Value::as_array) {
             for parameter in parameters {
+                let resolved_parameter = resolve_schema_refs(parameter, spec, &mut Vec::new(), 0);
+                let parameter = &resolved_parameter;
                 if let Some(name) = parameter.get("name").and_then(Value::as_str) {
                     let schema = parameter
                         .get("schema")
                         .cloned()
-                        .unwrap_or_else(|| json!({ "type": "string" }));
+                        .unwrap_or_else(|| {
+                            let mut legacy = serde_json::Map::new();
+                            for key in ["type", "format", "items", "enum", "default", "minimum", "maximum", "minLength", "maxLength", "pattern"] {
+                                if let Some(value) = parameter.get(key) {
+                                    legacy.insert(key.to_string(), value.clone());
+                                }
+                            }
+                                Value::Object(legacy)
+                        });
+                            let mut schema = resolve_schema_refs(&schema, spec, &mut Vec::new(), 0);
+                    if !schema.is_object() {
+                        schema = json!({ "type": "string" });
+                    }
+                    if let Some(schema) = schema.as_object_mut() {
+                        schema.insert(
+                            "x-mcp-in".to_string(),
+                            parameter.get("in").cloned().unwrap_or_else(|| json!("query")),
+                        );
+                    }
                     properties.insert(name.to_string(), schema);
                     if parameter.get("required").and_then(Value::as_bool).unwrap_or(false)
                         && !required.iter().any(|required_name| required_name == name)
@@ -187,7 +219,10 @@ fn build_input_schema(operation: &Value, path: &str, method: &str, path_paramete
         }
     }
 
-    let request_body = operation.get("requestBody");
+    let resolved_request_body = operation
+        .get("requestBody")
+        .map(|body| resolve_schema_refs(body, spec, &mut Vec::new(), 0));
+    let request_body = resolved_request_body.as_ref();
     let body_schema = request_body
         .and_then(|body| body.get("content"))
         .and_then(Value::as_object)
@@ -198,13 +233,30 @@ fn build_input_schema(operation: &Value, path: &str, method: &str, path_paramete
         })
         .and_then(|media_type| media_type.get("schema"));
     if let Some(schema) = body_schema {
-        properties.insert("body".to_string(), schema.clone());
+        properties.insert("body".to_string(), resolve_schema_refs(schema, spec, &mut Vec::new(), 0));
         if request_body
             .and_then(|body| body.get("required"))
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
             required.push("body".to_string());
+        }
+    } else if let Some(parameters) = operation.get("parameters").and_then(Value::as_array) {
+        if let Some(body_parameter) = parameters.iter().find(|parameter| {
+            parameter.get("in").and_then(Value::as_str) == Some("body")
+        }) {
+            let schema = body_parameter
+                .get("schema")
+                .cloned()
+                .unwrap_or_else(|| json!({ "type": "object" }));
+            let mut schema = resolve_schema_refs(&schema, spec, &mut Vec::new(), 0);
+            if let Some(schema) = schema.as_object_mut() {
+                schema.insert("x-mcp-in".to_string(), json!("body"));
+            }
+            properties.insert("body".to_string(), schema);
+            if body_parameter.get("required").and_then(Value::as_bool).unwrap_or(false) {
+                required.push("body".to_string());
+            }
         }
     }
 
@@ -215,7 +267,52 @@ fn build_input_schema(operation: &Value, path: &str, method: &str, path_paramete
     })
 }
 
-fn build_output_schema(operation: &Value) -> Value {
+fn resolve_schema_refs(schema: &Value, root: &Value, visited: &mut Vec<String>, depth: usize) -> Value {
+    if depth >= 32 {
+        return schema.clone();
+    }
+
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        if visited.iter().any(|seen| seen == reference) {
+            return schema.clone();
+        }
+        if let Some(target) = reference
+            .strip_prefix('#')
+            .and_then(|pointer| root.pointer(pointer))
+        {
+            visited.push(reference.to_string());
+            let mut resolved = resolve_schema_refs(target, root, visited, depth + 1);
+            visited.pop();
+            if let (Some(resolved), Some(siblings)) = (resolved.as_object_mut(), schema.as_object()) {
+                for (key, value) in siblings {
+                    if key != "$ref" {
+                        resolved.insert(key.clone(), resolve_schema_refs(value, root, visited, depth + 1));
+                    }
+                }
+            }
+            return resolved;
+        }
+        return schema.clone();
+    }
+
+    match schema {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| (key.clone(), resolve_schema_refs(value, root, visited, depth + 1)))
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|value| resolve_schema_refs(value, root, visited, depth + 1))
+                .collect(),
+        ),
+        _ => schema.clone(),
+    }
+}
+
+fn build_output_schema(operation: &Value, spec: &Value) -> Value {
     let empty_response = json!({});
     let response = operation
         .get("responses")
@@ -223,13 +320,34 @@ fn build_output_schema(operation: &Value) -> Value {
         .or_else(|| operation.get("responses").and_then(|responses| responses.get("201")))
         .or_else(|| operation.get("responses").and_then(|responses| responses.get("default")))
         .unwrap_or(&empty_response);
+    let response = resolve_schema_refs(response, spec, &mut Vec::new(), 0);
+
+    let response_schema = response
+        .get("content")
+        .and_then(Value::as_object)
+        .and_then(|content| content.get("application/json").or_else(|| content.values().next()))
+        .and_then(|media_type| media_type.get("schema"))
+        .or_else(|| response.get("schema"));
+    let body_schema = response_schema
+        .map(|schema| resolve_schema_refs(schema, spec, &mut Vec::new(), 0))
+        .unwrap_or_else(|| json!({ "type": "object" }));
 
     json!({
         "type": "object",
-        "description": format!("Response schema generated from OpenAPI operation: {}", response),
         "properties": {
-            "status": { "type": "string" },
-            "body": { "type": "object" }
+            "tool": { "type": "string" },
+            "path": { "type": "string" },
+            "method": { "type": "string" },
+            "risk": { "type": "string" },
+            "status": { "type": "string", "enum": ["executed", "approval_required"] },
+            "http_response": {
+                "type": "object",
+                "properties": {
+                    "status": { "type": "integer" },
+                    "body": body_schema
+                }
+            },
+            "approval_token": { "type": "string" }
         }
     })
 }

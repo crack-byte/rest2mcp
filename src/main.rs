@@ -6,12 +6,13 @@ mod openapi;
 mod security;
 
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Html,
     routing::{get, post},
     Json, Router,
@@ -76,6 +77,7 @@ pub struct GatewayService {
     security: Arc<SecurityGuard>,
     config: Arc<RwLock<GatewayConfig>>,
     store: SqliteStore,
+    request_times: Arc<Mutex<VecDeque<Instant>>>,
     current_spec_name: Arc<RwLock<String>>,
     default_api_base_url: String,
     http_client: Arc<HttpClient>,
@@ -110,6 +112,7 @@ impl GatewayService {
             default_api_base_url,
             http_client: Arc::new(http_client),
             store,
+            request_times: Arc::new(Mutex::new(VecDeque::new())),
         };
         match service.store.active_spec() {
             Ok(Some(name)) => {
@@ -170,6 +173,44 @@ impl GatewayService {
 
     pub fn clear_runtime_logs(&self) -> Result<usize, String> {
         self.store.clear_logs().map_err(|error| error.to_string())
+    }
+
+    fn allow_request(&self) -> bool {
+        let now = Instant::now();
+        let mut request_times = self.request_times.lock().expect("request limiter lock poisoned");
+        while request_times.front().is_some_and(|time| now.duration_since(*time).as_secs() >= 60) {
+            request_times.pop_front();
+        }
+        if request_times.len() >= self.config().requests_per_minute {
+            return false;
+        }
+        request_times.push_back(now);
+        true
+    }
+
+    fn authenticate_bearer(&self, headers: &HeaderMap) -> Result<CallerContext, String> {
+        let config = self.config();
+        if let Some(expected) = config.auth.bearer_token {
+            let supplied = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .ok_or_else(|| "missing bearer token".to_string())?;
+            if !constant_time_eq(supplied.as_bytes(), expected.as_bytes()) {
+                return Err("invalid bearer token".to_string());
+            }
+            Ok(CallerContext {
+                persona: Persona::ServiceAccount,
+                subject: "configured-service-account".to_string(),
+                scopes: config.auth.scopes,
+            })
+        } else {
+            Ok(CallerContext {
+                persona: Persona::Human,
+                subject: "local-client".to_string(),
+                scopes: vec!["read:resources".to_string()],
+            })
+        }
     }
 
     pub fn load_saved_spec_by_name(&self, name: &str) -> Result<SpecLoadResult, String> {
@@ -361,6 +402,9 @@ impl GatewayService {
     }
 
     async fn handle_request_inner(&self, request: &McpRequest, caller: &CallerContext) -> Result<McpResponse, String> {
+        if request.jsonrpc != "2.0" {
+            return Err("jsonrpc must be '2.0'".to_string());
+        }
         let fragmentation_check = vec![
             request.method.clone(),
             request.id.to_string(),
@@ -402,8 +446,16 @@ impl GatewayService {
                     return Err(format!("caller '{}' is not authorized for '{tool_name}'", caller.subject));
                 }
 
-                if self.security.requires_human_confirmation(tool_name) {
-                    let approval = self.security.create_approval_token(&caller.subject, tool_name);
+                if let Some(required) = tool.input_schema.get("required").and_then(Value::as_array) {
+                    for argument in required.iter().filter_map(Value::as_str) {
+                        if !matches!(argument, "method" | "path") && !params.get(argument).is_some() {
+                            return Err(format!("missing required argument '{argument}' for tool '{tool_name}'"));
+                        }
+                    }
+                }
+
+                if self.security.requires_human_confirmation(&tool) {
+                    let approval = self.security.create_approval_request(&caller.subject, tool_name, params.clone());
                     let audit = AuditEntry {
                         action: "tool_call".to_string(),
                         tool_name: tool_name.to_string(),
@@ -434,6 +486,52 @@ impl GatewayService {
                     .await
                     .map_err(|err| format!("backend execution failed for '{tool_name}': {err}"))?;
 
+                Ok(McpResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id.clone(),
+                    result: json!({
+                        "tool": tool.name,
+                        "path": tool.path,
+                        "method": tool.method,
+                        "risk": format!("{:?}", tool.risk),
+                        "status": "executed",
+                        "http_response": backend_response,
+                    }),
+                })
+            }
+            "tools/approve" => {
+                let params = request.params.clone().unwrap_or(Value::Null);
+                let token = params
+                    .get("approval_token")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "approval_token is required".to_string())?;
+                let (approval, original_params) = self
+                    .security
+                    .consume_approval_request(token, &caller.subject)?;
+                let tool = self
+                    .registry
+                    .read()
+                    .expect("registry lock poisoned")
+                    .find_by_name(&approval.tool_name)
+                    .ok_or_else(|| "approved tool is no longer available".to_string())?
+                    .clone();
+                if !self.security.authorize(caller, &tool) {
+                    return Err("caller is no longer authorized for the approved tool".to_string());
+                }
+                let backend_response = self
+                    .http_client
+                    .execute(&tool, &original_params)
+                    .await
+                    .map_err(|err| format!("approved backend execution failed for '{}': {err}", tool.name))?;
+                let audit = AuditEntry {
+                    action: "tool_approved_and_executed".to_string(),
+                    tool_name: tool.name.clone(),
+                    risk: tool.risk,
+                    subject: caller.subject.clone(),
+                    persona: caller.persona.clone(),
+                    ts: Utc::now(),
+                };
+                self.security.audit_write(&audit);
                 Ok(McpResponse {
                     jsonrpc: "2.0".to_string(),
                     id: request.id.clone(),
@@ -615,7 +713,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
               .status-box {{ margin-top: 12px; min-height: 24px; color: var(--muted); }}
               ul {{ list-style: none; padding: 0; margin: 12px 0 0; }}
               li {{ color: var(--text); }}
-              pre {{ white-space: pre-wrap; word-break: break-word; background: rgba(15,23,42,.9); border: 1px solid var(--line); border-radius: 12px; padding: 16px; color: var(--text); overflow: auto; margin-top: 16px; min-height: 180px; }}
+              pre {{ white-space: pre; word-break: normal; background: rgba(15,23,42,.9); border: 1px solid var(--line); border-radius: 12px; padding: 16px; color: var(--text); overflow: auto; margin-top: 16px; min-height: 180px; max-height: 420px; }}
               @media (max-width: 640px) {{ .topbar {{ flex-direction: column; align-items: flex-start; gap: 12px; }} }}
             </style>
           </head>
@@ -666,6 +764,14 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                   <button class="primary" data-mode="streamable-http">Streamable HTTP</button>
                   <button class="secondary" data-mode="stdio">Stdio</button>
                 </div>
+                                <div style="margin-top:16px;">
+                                    <label class="meta" for="dashboardAuthToken">Gateway bearer token (kept for this browser session only)</label>
+                                    <div class="controls" style="margin-top:8px;">
+                                        <input id="dashboardAuthToken" type="password" autocomplete="off" placeholder="Optional for local-only use" style="flex:1; min-width:240px; padding:10px 12px; border-radius:10px; border:1px solid var(--line); background:rgba(15,23,42,.9); color:var(--text);" />
+                                        <button class="secondary" id="saveDashboardTokenBtn" type="button">Use token</button>
+                                    </div>
+                                    <div class="meta" id="dashboardTokenStatus">Without a configured server token, HTTP access is read-only.</div>
+                                </div>
               </div>
 
               <div class="panel" style="margin-top: 24px;">
@@ -727,6 +833,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                                     <button class="secondary" id="listToolsBtn" type="button">Test tools/list</button>
                                     <button class="secondary" id="prepareToolCallBtn" type="button">Generate dummy request</button>
                                     <button class="primary" id="sendMcpRequestBtn" type="button">Send request</button>
+                                    <button class="success" id="approvePendingBtn" type="button" disabled>Approve pending action</button>
                                 </div>
                                 <div class="status-box" id="mcpTestStatus" role="status">Ready. Select a tool or test tools/list.</div>
                                 <h3 style="margin-bottom:8px;">Response</h3>
@@ -760,6 +867,20 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                             const toolSchemaEntries = {};
                             toolSchemaEntries.forEach((tool) => {{
                                 toolSchemas[tool.name] = tool;
+                            }});
+                            const apiFetch = (url, options = {{}}) => {{
+                                const headers = new Headers(options.headers || {{}});
+                                const token = sessionStorage.getItem('rest2mcp-auth-token');
+                                if (token) headers.set('Authorization', 'Bearer ' + token);
+                                return fetch(url, {{ ...options, headers }});
+                            }};
+                            const tokenInput = document.getElementById('dashboardAuthToken');
+                            tokenInput.value = sessionStorage.getItem('rest2mcp-auth-token') || '';
+                            document.getElementById('saveDashboardTokenBtn').addEventListener('click', () => {{
+                                const token = tokenInput.value.trim();
+                                if (token) sessionStorage.setItem('rest2mcp-auth-token', token);
+                                else sessionStorage.removeItem('rest2mcp-auth-token');
+                                document.getElementById('dashboardTokenStatus').textContent = token ? 'Token will be sent with dashboard and MCP requests for this session.' : 'Token cleared. Local-only mode is read-only for MCP.';
                             }});
               const render = (payload) => {{
                 document.getElementById('transportBadge').textContent = payload.transport;
@@ -863,7 +984,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                                 status.style.color = 'var(--muted)';
                                 output.textContent = 'Waiting for gateway response…';
                                 try {{
-                                    const response = await fetch('/mcp', {{
+                                    const response = await apiFetch('/mcp', {{
                                         method: 'POST',
                                         headers: {{ 'Content-Type': 'application/json' }},
                                         body: JSON.stringify(request)
@@ -872,6 +993,8 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                                     let payload;
                                     try {{ payload = JSON.parse(text); }} catch (_) {{ payload = text || '(empty response body)'; }}
                                     output.textContent = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+                                    const approvalToken = payload && payload.result && payload.result.approval_token;
+                                    document.getElementById('approvePendingBtn').disabled = !approvalToken;
                                     status.textContent = 'HTTP ' + response.status + (response.ok ? ' · request completed' : ' · request failed');
                                     status.style.color = response.ok ? '#a7f3d0' : '#fca5a5';
                                 }} catch (err) {{
@@ -894,6 +1017,16 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                             }});
                             document.getElementById('prepareToolCallBtn').addEventListener('click', prepareSelectedToolCall);
                             document.getElementById('sendMcpRequestBtn').addEventListener('click', sendMcpRequest);
+                            document.getElementById('approvePendingBtn').addEventListener('click', () => {{
+                                let previousResponse;
+                                try {{ previousResponse = JSON.parse(document.getElementById('mcpTestResponse').textContent); }} catch (_) {{ return; }}
+                                const approvalToken = previousResponse && previousResponse.result && previousResponse.result.approval_token;
+                                if (!approvalToken) return;
+                                if (!window.confirm('Approve and execute ' + previousResponse.result.tool + ' at ' + previousResponse.result.method + ' ' + previousResponse.result.path + '?')) return;
+                                setMcpRequest({{ jsonrpc: '2.0', id: 2, method: 'tools/approve', params: {{ approval_token: approvalToken }} }});
+                                document.getElementById('approvePendingBtn').disabled = true;
+                                sendMcpRequest();
+                            }});
                             testToolSelect.addEventListener('change', prepareSelectedToolCall);
 
               const setSpecStatus = (message, ok = true) => {{
@@ -903,7 +1036,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
               }};
 
               const refresh = async () => {{
-                const response = await fetch('/ui/status');
+                const response = await apiFetch('/ui/status');
                 const payload = await response.json();
                 render(payload);
               }};
@@ -911,7 +1044,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                             const refreshLogs = async () => {{
                                 const tbody = document.getElementById('runtimeLogsBody');
                                 try {{
-                                    const response = await fetch('/ui/logs');
+                                    const response = await apiFetch('/ui/logs');
                                     if (!response.ok) throw new Error('Unable to load logs');
                                     const logs = await response.json();
                                     tbody.replaceChildren();
@@ -952,7 +1085,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                             document.getElementById('refreshLogsBtn').addEventListener('click', refreshLogs);
                             document.getElementById('clearLogsBtn').addEventListener('click', async () => {{
                                 if (!window.confirm('Permanently clear all stored request logs?')) return;
-                                const response = await fetch('/ui/logs/clear', {{ method: 'POST' }});
+                                const response = await apiFetch('/ui/logs/clear', {{ method: 'POST' }});
                                 const payload = await response.json();
                                 if (!response.ok) {{
                                     window.alert(payload.error || 'Unable to clear logs.');
@@ -965,7 +1098,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                                 button.addEventListener('click', async () => {{
                                     const name = button.getAttribute('data-delete-spec');
                                     if (!window.confirm('Delete saved schema "' + name + '"?')) return;
-                                    const response = await fetch('/ui/spec/delete', {{
+                                    const response = await apiFetch('/ui/spec/delete', {{
                                         method: 'POST',
                                         headers: {{ 'Content-Type': 'application/json' }},
                                         body: JSON.stringify({{ name }})
@@ -987,7 +1120,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                   return;
                 }}
 
-                const response = await fetch('/ui/spec', {{
+                const response = await apiFetch('/ui/spec', {{
                   method: 'POST',
                   headers: {{ 'Content-Type': 'application/json' }},
                   body: JSON.stringify({{ spec: raw, name }})
@@ -1014,7 +1147,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
               document.querySelectorAll('[data-mode]').forEach((button) => {{
                 button.addEventListener('click', async () => {{
                   const mode = button.getAttribute('data-mode');
-                  const response = await fetch('/ui/mode', {{
+                  const response = await apiFetch('/ui/mode', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
                     body: JSON.stringify({{ mode }})
@@ -1059,7 +1192,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
               document.querySelectorAll('[data-load-spec]').forEach((button) => {{
                 button.addEventListener('click', async () => {{
                   const name = button.getAttribute('data-load-spec');
-                  const response = await fetch('/ui/spec/restore', {{
+                  const response = await apiFetch('/ui/spec/restore', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
                     body: JSON.stringify({{ name }})
@@ -1115,7 +1248,9 @@ async fn ui_logs(State(state): State<GatewayService>) -> Json<Vec<RuntimeLogEntr
 
 async fn ui_clear_logs(
     State(state): State<GatewayService>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_dashboard_auth(&state, &headers, "admin:write")?;
     state
         .clear_runtime_logs()
         .map(|deleted| Json(json!({ "ok": true, "deleted": deleted })))
@@ -1129,8 +1264,10 @@ async fn ui_clear_logs(
 
 async fn ui_delete_spec(
     State(state): State<GatewayService>,
+    headers: HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_dashboard_auth(&state, &headers, "admin:write")?;
     let name = payload
         .get("name")
         .and_then(Value::as_str)
@@ -1161,8 +1298,10 @@ async fn ui_set_mode(
 
 async fn ui_load_spec(
     State(state): State<GatewayService>,
+    headers: HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_dashboard_auth(&state, &headers, "admin:write")?;
     let raw = payload
         .get("spec")
         .and_then(serde_json::Value::as_str)
@@ -1204,8 +1343,10 @@ async fn ui_load_spec(
 
 async fn ui_restore_spec(
     State(state): State<GatewayService>,
+    headers: HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_dashboard_auth(&state, &headers, "admin:write")?;
     let name = payload
         .get("name")
         .and_then(serde_json::Value::as_str)
@@ -1246,35 +1387,70 @@ async fn ui_restore_spec(
 
 async fn handle_mcp(
     State(state): State<GatewayService>,
+    headers: HeaderMap,
     Json(payload): Json<McpRequest>,
-) -> Result<Json<Value>, StatusCode> {
-    let caller = CallerContext {
-        persona: Persona::Human,
-        subject: "demo-user".to_string(),
-        scopes: vec![
-            "read:resources".to_string(),
-            "write:resources".to_string(),
-            "admin:write".to_string(),
-        ],
-    };
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let caller = state.authenticate_bearer(&headers).map_err(|error| {
+        (StatusCode::UNAUTHORIZED, Json(json!({
+            "jsonrpc": "2.0",
+            "id": payload.id,
+            "error": { "code": -32001, "message": error }
+        })))
+    })?;
+    if !state.allow_request() {
+        return Err((StatusCode::TOO_MANY_REQUESTS, Json(json!({
+            "jsonrpc": "2.0",
+            "id": payload.id,
+            "error": { "code": -32000, "message": "request rate limit exceeded" }
+        }))));
+    }
 
     let response = match state.handle_request(&payload, &caller).await {
         Ok(response) => response,
         Err(err) => {
-            let status = if err.contains("not found") {
-                StatusCode::NOT_FOUND
+            let code = if err.contains("not found") || err.contains("unsupported") {
+                -32601
             } else if err.contains("not authorized") {
-                StatusCode::FORBIDDEN
-            } else if err.contains("unsupported") {
-                StatusCode::BAD_REQUEST
+                -32003
+            } else if err.contains("backend execution failed") || err.contains("backend request failed") {
+                -32002
             } else {
-                StatusCode::BAD_REQUEST
+                -32602
             };
-            return Err(status);
+            return Ok(Json(json!({
+                "jsonrpc": "2.0",
+                "id": payload.id,
+                "error": { "code": code, "message": err }
+            })));
         }
     };
 
     Ok(Json(json!(response)))
+}
+
+fn require_dashboard_auth(
+    state: &GatewayService,
+    headers: &HeaderMap,
+    required_scope: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let caller = state.authenticate_bearer(headers).map_err(|error| {
+        (StatusCode::UNAUTHORIZED, Json(json!({ "ok": false, "error": error })))
+    })?;
+    if state.config().auth.bearer_token.is_some() && !caller.scopes.iter().any(|scope| scope == required_scope) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": format!("missing required scope '{required_scope}'") })),
+        ));
+    }
+    Ok(())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        difference |= usize::from(left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0));
+    }
+    difference == 0
 }
 
 async fn run_stdio_transport(service: GatewayService) -> Result<(), Box<dyn std::error::Error>> {
@@ -1373,7 +1549,8 @@ async fn main() {
 mod tests {
     use std::env;
 
-    use serde_json::json;
+    use serde_json::{json, Value};
+    use axum::http::HeaderMap;
 
     use crate::config::GatewayConfig;
     use crate::http_client::HttpClient;
@@ -1453,6 +1630,31 @@ mod tests {
             "paths": {}
         });
         assert_eq!(crate::openapi_server_url(&swagger_without_scheme).unwrap().as_deref(), Some("https://petstore.swagger.io/v2"));
+    }
+
+    #[test]
+    fn resolves_referenced_openapi_request_body_schemas() {
+        let registry = ToolRegistry::from_openapi(&json!({
+            "openapi": "3.1.0",
+            "info": { "title": "Pets", "version": "1" },
+            "paths": { "/pets": { "post": {
+                "operationId": "createPet",
+                "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Pet" } } } },
+                "responses": { "201": { "description": "created" } }
+            } } },
+            "components": { "schemas": { "Pet": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": { "type": "string", "example": "Fido" },
+                    "tag": { "type": "string" }
+                }
+            } } }
+        })).unwrap();
+        let body = &registry.find_by_name("createpet").unwrap().input_schema["properties"]["body"];
+        assert_eq!(body["properties"]["name"]["example"], "Fido");
+        assert_eq!(body["required"][0], "name");
+        assert!(body.get("$ref").is_none());
     }
 
     #[test]
@@ -1663,9 +1865,18 @@ mod tests {
             scopes: vec!["read:resources".to_string(), "admin:write".to_string()],
         };
 
-        let token = guard.create_approval_token(&caller.subject, "delete_invoices_id");
-        assert!(guard.validate_approval_token(&token.token));
-        assert!(guard.requires_human_confirmation("delete_invoices_id"));
+        let token = guard.create_approval_request(&caller.subject, "delete_invoices_id", json!({}));
+        assert!(guard.consume_approval_request(&token.token, &caller.subject).is_ok());
+        let registry = ToolRegistry::from_openapi(&json!({
+            "openapi": "3.1.0",
+            "info": { "title": "Governance", "version": "1" },
+            "paths": {
+                "/danger": { "delete": { "operationId": "archiveRecord", "responses": { "200": { "description": "ok" } } } },
+                "/harmless": { "get": { "operationId": "deletePreview", "responses": { "200": { "description": "ok" } } } }
+            }
+        })).unwrap();
+        assert!(guard.requires_human_confirmation(registry.find_by_name("archiverecord").unwrap()));
+        assert!(!guard.requires_human_confirmation(registry.find_by_name("deletepreview").unwrap()));
     }
 
     #[test]
@@ -1789,5 +2000,201 @@ mod tests {
         assert_eq!(response.result.get("status").and_then(|value| value.as_str()), Some("executed"));
         assert_eq!(body.get("id").and_then(|value| value.as_str()), Some("42"));
         assert_eq!(body.get("status").and_then(|value| value.as_str()), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn maps_openapi_query_header_body_and_path_parameters_correctly() {
+        use axum::{extract::{Path, Query}, http::HeaderMap, routing::post, Json, Router};
+        use std::collections::HashMap;
+
+        let app = Router::new().route(
+            "/v1/orders/{orderId}",
+            post(|Path(order_id): Path<String>, Query(query): Query<HashMap<String, String>>, headers: HeaderMap, Json(body): Json<Value>| async move {
+                Json(json!({
+                    "order_id": order_id,
+                    "state": query.get("state"),
+                    "tenant": headers.get("x-tenant").and_then(|value| value.to_str().ok()),
+                    "body": body
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+
+        let registry = ToolRegistry::from_openapi(&json!({
+            "openapi": "3.1.0",
+            "info": { "title": "Orders", "version": "1" },
+            "paths": {
+                "/orders/{orderId}": {
+                    "parameters": [{ "name": "orderId", "in": "path", "required": true, "schema": { "type": "string" } }],
+                    "post": {
+                        "operationId": "submitOrder",
+                        "parameters": [
+                            { "name": "state", "in": "query", "required": true, "schema": { "type": "string" } },
+                            { "name": "x-tenant", "in": "header", "required": true, "schema": { "type": "string" } }
+                        ],
+                        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                }
+            }
+        })).unwrap();
+        let service = GatewayService::from_registry_with_http_client(
+            registry,
+            GatewayConfig::default(),
+            HttpClient::new(format!("http://{addr}/v1")),
+        );
+        let caller = CallerContext {
+            persona: Persona::Human,
+            subject: "mapping-test".to_string(),
+            scopes: vec!["write:resources".to_string()],
+        };
+        let response = service.handle_request(&crate::mcp::McpRequest {
+            jsonrpc: "2.0".to_string(),
+            id: json!(1),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "submitorder",
+                "orderId": "42",
+                "state": "ready",
+                "x-tenant": "north",
+                "body": { "total": 19.5 }
+            })),
+        }, &caller).await.unwrap();
+        let body = &response.result["http_response"]["body"];
+        assert_eq!(body["order_id"], "42");
+        assert_eq!(body["state"], "ready");
+        assert_eq!(body["tenant"], "north");
+        assert_eq!(body["body"]["total"], 19.5);
+    }
+
+    #[test]
+    fn bearer_auth_and_rate_limits_enforce_configured_governance() {
+        let mut config = GatewayConfig::default();
+        config.auth.bearer_token = Some("local-test-token".to_string());
+        config.auth.scopes = vec!["read:resources".to_string()];
+        config.requests_per_minute = 1;
+        let service = GatewayService::from_registry_with_http_client(
+            build_registry().unwrap(),
+            config,
+            HttpClient::new("http://backend.example.test"),
+        );
+
+        let mut headers = HeaderMap::new();
+        assert!(service.authenticate_bearer(&headers).is_err());
+        headers.insert("authorization", "Bearer wrong".parse().unwrap());
+        assert!(service.authenticate_bearer(&headers).is_err());
+        headers.insert("authorization", "Bearer local-test-token".parse().unwrap());
+        let caller = service.authenticate_bearer(&headers).unwrap();
+        assert_eq!(caller.scopes, vec!["read:resources"]);
+        assert!(service.allow_request());
+        assert!(!service.allow_request());
+
+        let mut remote_config = GatewayConfig::default();
+        remote_config.http_bind = "0.0.0.0:3000".to_string();
+        assert!(remote_config.validate().is_err());
+        remote_config.auth.bearer_token = Some("required-for-remote".to_string());
+        assert!(remote_config.validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_required_arguments_before_backend_dispatch() {
+        let registry = ToolRegistry::from_openapi(&json!({
+            "openapi": "3.1.0",
+            "info": { "title": "Search", "version": "1" },
+            "paths": { "/search": { "get": {
+                "operationId": "searchItems",
+                "parameters": [{ "name": "q", "in": "query", "required": true, "schema": { "type": "string" } }],
+                "responses": { "200": { "description": "ok" } }
+            } } }
+        })).unwrap();
+        let service = GatewayService::from_registry_with_http_client(
+            registry,
+            GatewayConfig::default(),
+            HttpClient::new("http://127.0.0.1:1"),
+        );
+        let caller = CallerContext {
+            persona: Persona::Human,
+            subject: "test".to_string(),
+            scopes: vec!["read:resources".to_string()],
+        };
+        let error = service.handle_request(&crate::mcp::McpRequest {
+            jsonrpc: "2.0".to_string(),
+            id: json!(1),
+            method: "tools/call".to_string(),
+            params: Some(json!({ "name": "searchitems" })),
+        }, &caller).await.unwrap_err();
+        assert!(error.contains("missing required argument 'q'"));
+    }
+
+    #[tokio::test]
+    async fn destructive_operation_requires_subject_bound_single_use_approval() {
+        use axum::{routing::delete, Json, Router};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+        let executions = Arc::new(AtomicUsize::new(0));
+        let backend_executions = executions.clone();
+        let app = Router::new().route(
+            "/records/{id}",
+            delete(move |axum::extract::Path(id): axum::extract::Path<String>| {
+                let backend_executions = backend_executions.clone();
+                async move {
+                    backend_executions.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({ "deleted": id }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+
+        let registry = ToolRegistry::from_openapi(&json!({
+            "openapi": "3.1.0",
+            "info": { "title": "Records", "version": "1" },
+            "paths": { "/records/{id}": { "delete": {
+                "operationId": "archiveRecord",
+                "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+                "responses": { "200": { "description": "deleted" } }
+            } } }
+        })).unwrap();
+        let service = GatewayService::from_registry_with_http_client(
+            registry,
+            GatewayConfig::default(),
+            HttpClient::new(format!("http://{addr}")),
+        );
+        let caller = CallerContext {
+            persona: Persona::Human,
+            subject: "approver-one".to_string(),
+            scopes: vec!["admin:write".to_string()],
+        };
+        let call = crate::mcp::McpRequest {
+            jsonrpc: "2.0".to_string(),
+            id: json!(1),
+            method: "tools/call".to_string(),
+            params: Some(json!({ "name": "archiverecord", "id": "42" })),
+        };
+        let pending = service.handle_request(&call, &caller).await.unwrap();
+        assert_eq!(pending.result["status"], "approval_required");
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        let token = pending.result["approval_token"].as_str().unwrap();
+
+        let mut other_caller = caller.clone();
+        other_caller.subject = "approver-two".to_string();
+        let approve = crate::mcp::McpRequest {
+            jsonrpc: "2.0".to_string(),
+            id: json!(2),
+            method: "tools/approve".to_string(),
+            params: Some(json!({ "approval_token": token })),
+        };
+        assert!(service.handle_request(&approve, &other_caller).await.is_err());
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+
+        let approved = service.handle_request(&approve, &caller).await.unwrap();
+        assert_eq!(approved.result["status"], "executed");
+        assert_eq!(approved.result["http_response"]["body"]["deleted"], "42");
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert!(service.handle_request(&approve, &caller).await.is_err());
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
     }
 }

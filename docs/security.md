@@ -21,6 +21,10 @@ This aligns with the project requirements for Green/Yellow/Red mapping and suppo
 
 ## Authorization model
 
+HTTP deployments bind to loopback by default. Binding to a non-loopback address requires `REST2MCP_AUTH_TOKEN`; `/mcp` requires that bearer token and receives only the scopes listed in `REST2MCP_AUTH_SCOPES` (read-only by default). Dashboard changes such as loading/deleting specs and clearing logs require `admin:write` when bearer auth is enabled. MCP requests are limited by `REST2MCP_REQUESTS_PER_MINUTE` (process-wide; default 120). Configure `REST2MCP_BACKEND_BEARER_TOKEN` to inject a backend credential; it overrides any caller-supplied Authorization header.
+
+This static-token mechanism is a minimal deployment safeguard, not OAuth/SSO, per-user identity, a per-client rate limiter, or a substitute for TLS. Terminate TLS at a trusted proxy and use a production identity provider for multi-user deployments.
+
 Tool-level access is checked against caller scopes. A caller must satisfy all required scopes for a tool before the tool is visible or executable.
 
 Example:
@@ -31,10 +35,16 @@ Example:
 
 ## Human approval
 
-Destructive operations are treated as requiring human confirmation. The security layer can:
+Destructive operations are identified by HTTP method/risk rather than tool name. A call returns a short-lived approval token without calling the backend; submit a JSON-RPC `tools/approve` request with that token after review. Approval is bound to the initiating caller, rechecks that caller's scopes, and is consumed once. The dashboard also offers an explicit confirmation button for pending calls.
 
-- identify destructive tool names
+The in-memory pending-approval store is lost on restart, which safely invalidates outstanding tokens. With the current shared static bearer token, approval is bound to that configured service identity, not an independently authenticated human identity.
+
+The security layer can:
+
+- identify destructive operations from their HTTP method/risk
 - generate a single-use approval token
+- retain the original call parameters until approval
+- execute the approved operation once, after reauthorization
 - log the request as a pending action
 - reject replay or stale confirmation attempts
 
@@ -45,6 +55,8 @@ The gateway inspects request payload text and flags suspicious prompt-splitting 
 ## Logging hygiene
 
 In stdio mode, all logs go to stderr. The JSON-RPC stream remains on stdout only, preventing protocol corruption.
+
+OpenAPI path/query/header/cookie/body parameter locations are preserved and mapped to their respective HTTP request locations. Local `$ref` schemas are expanded for tool argument and response schemas; unsupported OpenAPI serialization styles and remote references are not fully implemented.
 
 ## Future hardening
 

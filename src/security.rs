@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::mcp::{RiskClassification, ToolDefinition};
@@ -55,7 +56,13 @@ impl ApprovalToken {
 
 #[derive(Debug, Clone, Default)]
 pub struct SecurityGuard {
-    approvals: Arc<Mutex<HashMap<String, ApprovalToken>>>,
+    approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingApproval {
+    approval: ApprovalToken,
+    params: Value,
 }
 
 impl SecurityGuard {
@@ -67,12 +74,8 @@ impl SecurityGuard {
         caller.can_access(tool)
     }
 
-    pub fn requires_human_confirmation(&self, tool_name: &str) -> bool {
-        let normalized = tool_name.to_ascii_lowercase();
-        normalized.contains("delete")
-            || normalized.contains("remove")
-            || normalized.contains("purge")
-            || normalized.contains("reset")
+    pub fn requires_human_confirmation(&self, tool: &ToolDefinition) -> bool {
+        tool.method.eq_ignore_ascii_case("delete") || tool.risk == RiskClassification::Critical
     }
 
     pub fn audit_write(&self, entry: &AuditEntry) {
@@ -85,7 +88,7 @@ impl SecurityGuard {
         );
     }
 
-    pub fn create_approval_token(&self, subject: &str, tool_name: &str) -> ApprovalToken {
+    pub fn create_approval_request(&self, subject: &str, tool_name: &str, params: Value) -> ApprovalToken {
         let token = Uuid::new_v4().to_string();
         let expires_at = Utc::now() + Duration::minutes(5);
         let approval = ApprovalToken {
@@ -98,18 +101,26 @@ impl SecurityGuard {
         self.approvals
             .lock()
             .expect("approval store lock poisoned")
-            .insert(token.clone(), approval.clone());
+            .insert(token.clone(), PendingApproval { approval: approval.clone(), params });
 
         approval
     }
 
-    pub fn validate_approval_token(&self, token: &str) -> bool {
-        let now = Utc::now();
-        let approvals = self.approvals.lock().expect("approval store lock poisoned");
-        approvals
+    pub fn consume_approval_request(&self, token: &str, subject: &str) -> Result<(ApprovalToken, Value), String> {
+        let mut approvals = self.approvals.lock().expect("approval store lock poisoned");
+        let pending = approvals
             .get(token)
-            .map(|approval| approval.is_valid(now))
-            .unwrap_or(false)
+            .cloned()
+            .ok_or_else(|| "approval token is invalid or already used".to_string())?;
+        if pending.approval.subject != subject {
+            return Err("approval token belongs to a different caller".to_string());
+        }
+        if !pending.approval.is_valid(Utc::now()) {
+            approvals.remove(token);
+            return Err("approval token has expired".to_string());
+        }
+        approvals.remove(token);
+        Ok((pending.approval, pending.params))
     }
 
     pub fn detect_fragmentation(&self, messages: &[String]) -> bool {

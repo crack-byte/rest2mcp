@@ -36,6 +36,8 @@ REST2MCP is a Rust-based OpenAPI-to-MCP gateway that translates OpenAPI 3.x docu
 
 Backend calls use the first URL in an OpenAPI 3 document's `servers` list, including its base path. Swagger 2.0 documents use `schemes`, `host`, and `basePath` (HTTPS is assumed if `schemes` is omitted). If neither format specifies a backend URL, the gateway falls back to `REST2MCP_API_BASE_URL` (default: `http://127.0.0.1:8080`). OpenAPI server URL variables use their declared defaults.
 
+Operation tools retain `operationId` names and map path, query, header, cookie, and JSON body arguments. Required top-level arguments are checked before dispatch, local schema references are expanded, and duplicate generated tool names are rejected. OpenAPI serialization styles and remote `$ref` resolution are not fully supported.
+
 ## Environment variables
 
 - REST2MCP_BIND: bind address, default 0.0.0.0:3000
@@ -44,11 +46,17 @@ Backend calls use the first URL in an OpenAPI 3 document's `servers` list, inclu
 - REST2MCP_ENABLE_UI: true/false, enables the lightweight web dashboard at /ui
 - REST2MCP_API_BASE_URL: fallback API base URL for OpenAPI documents without a `servers` entry
 - REST2MCP_DB_PATH: SQLite database file path, default `rest2mcp.sqlite3` in the working directory
+- REST2MCP_AUTH_TOKEN: optional gateway bearer token; required when binding to a non-loopback address
+- REST2MCP_AUTH_SCOPES: comma-separated scopes granted to that token; defaults to `read:resources`
+- REST2MCP_REQUESTS_PER_MINUTE: process-wide MCP request limit, default `120`
+- REST2MCP_BACKEND_BEARER_TOKEN: optional bearer credential injected into backend requests; tool arguments cannot override it
 - REST2MCP_DUAL_PERSONA: true/false
 - REST2MCP_ALLOW_HUMAN_SSO: true/false
 - REST2MCP_ALLOW_SERVICE_ACCOUNTS: true/false
 
 Saved OpenAPI specs, the active schema selection, and recent request logs are stored in SQLite. The dashboard lets you restore or delete saved specs and clear request logs. The database retains up to 10 saved specs and 1,000 request log entries.
+
+HTTP defaults to loopback. For remote binding, configure a strong `REST2MCP_AUTH_TOKEN`; remote dashboard mutations additionally require the `admin:write` scope. Set scopes explicitly, for example `read:resources,write:resources,admin:write`, only when needed. The request limit is global to this process, not per identity. The current bearer-token setup is a basic deployment guard, not OAuth/SSO or a replacement for TLS and a production identity provider.
 
 ## Running tests
 

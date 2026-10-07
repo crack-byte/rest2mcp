@@ -3,10 +3,11 @@ use std::{env, sync::{Arc, RwLock}};
 use reqwest::{Client, Method, Url};
 use serde_json::{json, Map, Value};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpClient {
     base_url: Arc<RwLock<String>>,
     client: Client,
+    backend_bearer_token: Option<String>,
 }
 
 impl HttpClient {
@@ -14,6 +15,7 @@ impl HttpClient {
         Self {
             base_url: Arc::new(RwLock::new(base_url.into().trim_end_matches('/').to_string())),
             client: Client::new(),
+            backend_bearer_token: env::var("REST2MCP_BACKEND_BEARER_TOKEN").ok().filter(|value| !value.is_empty()),
         }
     }
 
@@ -51,87 +53,119 @@ impl HttpClient {
         let method = tool.method.parse::<Method>().map_err(|err| err.to_string())?;
         let empty_params = Map::new();
         let params_obj = params.as_object().unwrap_or(&empty_params);
+        let properties = tool.input_schema.get("properties").and_then(Value::as_object);
+        if let Some(required) = tool.input_schema.get("required").and_then(Value::as_array) {
+            for required in required.iter().filter_map(Value::as_str) {
+                if !matches!(required, "method" | "path")
+                    && !params_obj.contains_key(required)
+                {
+                    return Err(format!("missing required argument '{required}' for tool '{}'", tool.name));
+                }
+            }
+        }
 
-        let path_template = tool.path.clone();
-        let mut path = tool.path.clone();
+        let mut parsed_url = Url::parse(&self.base_url())
+            .map_err(|err| format!("invalid backend base URL: {err}"))?;
+        {
+            let mut segments = parsed_url
+                .path_segments_mut()
+                .map_err(|_| "backend base URL cannot be a base URL".to_string())?;
+            segments.pop_if_empty();
+            for segment in tool.path.split('/').filter(|segment| !segment.is_empty()) {
+                if segment.starts_with('{') && segment.ends_with('}') {
+                    let name = &segment[1..segment.len() - 1];
+                    let value = params_obj
+                        .get(name)
+                        .ok_or_else(|| format!("missing path parameter '{name}' for tool '{}'", tool.name))?;
+                    segments.push(&value_as_string(value));
+                } else {
+                    segments.push(segment);
+                }
+            }
+        }
+
+        let mut request_headers = reqwest::header::HeaderMap::new();
+        let mut body_parameters = Map::new();
+        let mut cookie_pairs = Vec::new();
         for (key, value) in params_obj {
-            if matches!(key.as_str(), "name" | "method" | "path" | "body" | "headers") {
+            if matches!(key.as_str(), "name" | "method" | "path" | "headers" | "body") {
                 continue;
             }
-
-            let token = format!("{{{key}}}");
-            if path_template.contains(&token) {
-                let replacement = value_as_string(value);
-                path = path.replace(&token, &replacement);
+            let location = properties
+                .and_then(|properties| properties.get(key))
+                .and_then(|schema| schema.get("x-mcp-in"))
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    if tool.path.split('/').any(|segment| segment == format!("{{{key}}}")) { "path" } else { "query" }
+                });
+            match location {
+                "path" => {}
+                "query" => append_query_value(&mut parsed_url, key, value),
+                "header" => {
+                    let header_name = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+                        .map_err(|err| format!("invalid header parameter '{key}': {err}"))?;
+                    let header_value = reqwest::header::HeaderValue::from_str(&value_as_string(value))
+                        .map_err(|err| format!("invalid value for header parameter '{key}': {err}"))?;
+                    request_headers.append(header_name, header_value);
+                }
+                "cookie" => cookie_pairs.push(format!("{key}={}", value_as_string(value))),
+                "body" => {
+                    if let Value::Object(body) = value {
+                        body_parameters.extend(body.clone());
+                    }
+                }
+                _ => return Err(format!("unsupported parameter location '{location}' for '{key}'")),
             }
         }
-
-        let base_url = self.base_url();
-        let url = format!(
-            "{}{}",
-            base_url,
-            if path.starts_with('/') { path.to_string() } else { format!("/{path}") }
-        );
-
-        let mut query_pairs = Vec::new();
-        for (key, value) in params_obj {
-            if matches!(key.as_str(), "name" | "method" | "path" | "body" | "headers") {
-                continue;
-            }
-
-            let token = format!("{{{key}}}");
-            if path_template.contains(&token) {
-                continue;
-            }
-
-            query_pairs.push((key.clone(), value_as_string(value)));
-        }
-
-        let mut parsed_url = Url::parse(&url).map_err(|err| format!("invalid backend URL '{url}': {err}"))?;
-        for (key, value) in query_pairs {
-            parsed_url.query_pairs_mut().append_pair(&key, &value);
-        }
-
-        let mut request = self.client.request(method, parsed_url);
 
         if let Some(Value::Object(headers)) = params.get("headers") {
             for (key, value) in headers {
-                let header_value = value_as_string(value);
-                request = request.header(key, header_value);
+                let header_name = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+                    .map_err(|err| format!("invalid header name '{key}': {err}"))?;
+                let header_value = reqwest::header::HeaderValue::from_str(&value_as_string(value))
+                    .map_err(|err| format!("invalid value for header '{key}': {err}"))?;
+                request_headers.insert(header_name, header_value);
             }
         }
+        if !cookie_pairs.is_empty() {
+            request_headers.insert(
+                reqwest::header::COOKIE,
+                reqwest::header::HeaderValue::from_str(&cookie_pairs.join("; "))
+                    .map_err(|err| format!("invalid cookie parameter: {err}"))?,
+            );
+        }
+        if let Some(token) = &self.backend_bearer_token {
+            let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|err| format!("invalid configured backend bearer token: {err}"))?;
+            request_headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
 
-        let body = if let Some(body_value) = params.get("body") {
-            body_value.clone()
-        } else {
-            let mut payload = Map::new();
-            for (key, value) in params_obj {
-                if matches!(key.as_str(), "name" | "method" | "path" | "headers" | "body") {
-                    continue;
+        let mut request = self.client.request(method, parsed_url).headers(request_headers);
+        let body = params.get("body").cloned().unwrap_or_else(|| {
+            if body_parameters.is_empty() {
+                let mut flattened = Map::new();
+                if let Some(properties) = properties {
+                    for (key, value) in params_obj {
+                        let location = properties
+                            .get(key)
+                            .and_then(|schema| schema.get("x-mcp-in"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("query");
+                        if location == "body" {
+                            flattened.insert(key.clone(), value.clone());
+                        }
+                    }
                 }
-
-                let token = format!("{{{key}}}");
-                if path_template.contains(&token) {
-                    continue;
-                }
-
-                if tool.method.eq_ignore_ascii_case("get") || tool.method.eq_ignore_ascii_case("delete") {
-                    continue;
-                }
-
-                payload.insert(key.clone(), value.clone());
-            }
-
-            if payload.is_empty() {
-                Value::Null
+                if flattened.is_empty() { Value::Null } else { Value::Object(flattened) }
             } else {
-                Value::Object(payload)
+                Value::Object(body_parameters)
             }
-        };
-
+        });
         if !matches!(body, Value::Null)
             && !tool.method.eq_ignore_ascii_case("get")
             && !tool.method.eq_ignore_ascii_case("delete")
+            && !tool.method.eq_ignore_ascii_case("head")
+            && !tool.method.eq_ignore_ascii_case("options")
         {
             request = request.json(&body);
         }
@@ -166,6 +200,17 @@ impl HttpClient {
             "status": status.as_u16(),
             "body": parsed
         }))
+    }
+}
+
+fn append_query_value(url: &mut Url, key: &str, value: &Value) {
+    let mut query = url.query_pairs_mut();
+    if let Some(values) = value.as_array() {
+        for item in values {
+            query.append_pair(key, &value_as_string(item));
+        }
+    } else {
+        query.append_pair(key, &value_as_string(value));
     }
 }
 

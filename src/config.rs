@@ -35,6 +35,9 @@ pub struct AuthConfig {
     pub dual_persona: bool,
     pub allow_human_sso: bool,
     pub allow_service_accounts: bool,
+    #[serde(skip_serializing)]
+    pub bearer_token: Option<String>,
+    pub scopes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +47,7 @@ pub struct GatewayConfig {
     pub log_to_stderr: bool,
     pub auth: AuthConfig,
     pub ui_enabled: bool,
+    pub requests_per_minute: usize,
 }
 
 impl GatewayConfig {
@@ -54,7 +58,7 @@ impl GatewayConfig {
             .unwrap_or_default();
 
         let http_bind = env::var("REST2MCP_BIND")
-            .unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+            .unwrap_or_else(|_| "127.0.0.1:3000".to_string());
 
         let log_to_stderr = env::var("REST2MCP_LOG_TO_STDERR")
             .map(|value| value.parse::<bool>().unwrap_or(true))
@@ -74,7 +78,21 @@ impl GatewayConfig {
             allow_service_accounts: env::var("REST2MCP_ALLOW_SERVICE_ACCOUNTS")
                 .map(|value| value.parse::<bool>().unwrap_or(true))
                 .unwrap_or(true),
+            bearer_token: env::var("REST2MCP_AUTH_TOKEN").ok().filter(|value| !value.is_empty()),
+            scopes: env::var("REST2MCP_AUTH_SCOPES")
+                .unwrap_or_else(|_| "read:resources".to_string())
+                .split(',')
+                .map(str::trim)
+                .filter(|scope| !scope.is_empty())
+                .map(ToOwned::to_owned)
+                .collect(),
         };
+
+        let requests_per_minute = env::var("REST2MCP_REQUESTS_PER_MINUTE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(120);
 
         Self {
             transport,
@@ -82,6 +100,7 @@ impl GatewayConfig {
             log_to_stderr,
             auth,
             ui_enabled,
+            requests_per_minute,
         }
     }
 
@@ -90,8 +109,10 @@ impl GatewayConfig {
             return Err("REST2MCP_BIND cannot be empty".to_string());
         }
 
-        if !self.http_bind.contains(':') {
-            return Err(format!("invalid bind address '{}'; expected host:port", self.http_bind));
+        let bind = self.http_bind.parse::<std::net::SocketAddr>()
+            .map_err(|_| format!("invalid bind address '{}'; expected an IP:port socket address", self.http_bind))?;
+        if !bind.ip().is_loopback() && self.auth.bearer_token.is_none() {
+            return Err("REST2MCP_AUTH_TOKEN is required when REST2MCP_BIND is not loopback".to_string());
         }
 
         Ok(())
@@ -102,14 +123,17 @@ impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             transport: TransportMode::StreamableHttp,
-            http_bind: "0.0.0.0:3000".to_string(),
+            http_bind: "127.0.0.1:3000".to_string(),
             log_to_stderr: true,
             auth: AuthConfig {
                 dual_persona: true,
                 allow_human_sso: true,
                 allow_service_accounts: true,
+                bearer_token: None,
+                scopes: vec!["read:resources".to_string()],
             },
             ui_enabled: true,
+            requests_per_minute: 120,
         }
     }
 }
