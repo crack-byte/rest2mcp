@@ -1,4 +1,4 @@
-use std::{env, sync::{Arc, RwLock}};
+use std::{env, sync::{Arc, RwLock}, time::Duration};
 
 use reqwest::{Client, Method, Url};
 use serde_json::{json, Map, Value};
@@ -12,17 +12,28 @@ pub struct HttpClient {
 
 impl HttpClient {
     pub fn new(base_url: impl Into<String>) -> Self {
+        Self::new_with_timeout(base_url, Duration::from_secs(30))
+    }
+
+    pub fn new_with_timeout(base_url: impl Into<String>, timeout: Duration) -> Self {
         Self {
             base_url: Arc::new(RwLock::new(base_url.into().trim_end_matches('/').to_string())),
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(timeout)
+                .build()
+                .expect("HTTP client configuration must be valid"),
             backend_bearer_token: env::var("REST2MCP_BACKEND_BEARER_TOKEN").ok().filter(|value| !value.is_empty()),
         }
     }
 
     pub fn from_env() -> Self {
+        Self::from_env_with_timeout(Duration::from_secs(30))
+    }
+
+    pub fn from_env_with_timeout(timeout: Duration) -> Self {
         let base_url = env::var("REST2MCP_API_BASE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
-        Self::new(base_url)
+        Self::new_with_timeout(base_url, timeout)
     }
 
     pub fn base_url(&self) -> String {

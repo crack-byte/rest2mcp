@@ -31,10 +31,21 @@ pub struct StoredSpec {
 #[derive(Clone)]
 pub struct SqliteStore {
     connection: Arc<Mutex<Connection>>,
+    saved_specs_limit: usize,
+    runtime_log_limit: usize,
 }
 
 impl SqliteStore {
+    #[cfg(test)]
     pub fn open(path: impl AsRef<Path>) -> Result<Self, rusqlite::Error> {
+        Self::open_with_limits(path, 10, 1000)
+    }
+
+    pub fn open_with_limits(
+        path: impl AsRef<Path>,
+        saved_specs_limit: usize,
+        runtime_log_limit: usize,
+    ) -> Result<Self, rusqlite::Error> {
         let path = path.as_ref();
         if path != Path::new(":memory:") {
             if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
@@ -68,15 +79,19 @@ impl SqliteStore {
                  duration_ms INTEGER NOT NULL
              );",
         )?;
-        Ok(Self { connection: Arc::new(Mutex::new(connection)) })
+        Ok(Self {
+            connection: Arc::new(Mutex::new(connection)),
+            saved_specs_limit: saved_specs_limit.max(1),
+            runtime_log_limit: runtime_log_limit.max(1),
+        })
     }
 
-    pub fn open_default() -> Result<Self, rusqlite::Error> {
+    pub fn open_default(saved_specs_limit: usize, runtime_log_limit: usize) -> Result<Self, rusqlite::Error> {
         #[cfg(test)]
         let path = ":memory:".to_string();
         #[cfg(not(test))]
         let path = env::var("REST2MCP_DB_PATH").unwrap_or_else(|_| "rest2mcp.sqlite3".to_string());
-        Self::open(path)
+        Self::open_with_limits(path, saved_specs_limit, runtime_log_limit)
     }
 
     pub fn save_spec(&self, spec: &StoredSpec) -> Result<(), rusqlite::Error> {
@@ -89,8 +104,8 @@ impl SqliteStore {
             params![spec.name, spec.raw, spec.tool_count, spec.version, spec.updated_at, spec.api_base_url],
         )?;
         connection.execute(
-            "DELETE FROM specs WHERE name NOT IN (SELECT name FROM specs ORDER BY updated_at DESC LIMIT 10)",
-            [],
+            "DELETE FROM specs WHERE name NOT IN (SELECT name FROM specs ORDER BY updated_at DESC LIMIT ?1)",
+            [self.saved_specs_limit as i64],
         )?;
         Ok(())
     }
@@ -158,8 +173,8 @@ impl SqliteStore {
                 entry.http_status, entry.duration_ms.min(i64::MAX as u128) as i64],
         )?;
         connection.execute(
-            "DELETE FROM runtime_logs WHERE id NOT IN (SELECT id FROM runtime_logs ORDER BY id DESC LIMIT 1000)",
-            [],
+            "DELETE FROM runtime_logs WHERE id NOT IN (SELECT id FROM runtime_logs ORDER BY id DESC LIMIT ?1)",
+            [self.runtime_log_limit.min(i64::MAX as usize) as i64],
         )?;
         Ok(())
     }
@@ -167,10 +182,10 @@ impl SqliteStore {
     pub fn recent_logs(&self, limit: usize) -> Result<Vec<RuntimeLogEntry>, rusqlite::Error> {
         let connection = self.connection.lock().expect("SQLite connection lock poisoned");
         let mut statement = connection.prepare(
-            "SELECT timestamp, request, tool, backend, outcome, http_status, duration_ms
-             FROM runtime_logs ORDER BY id DESC LIMIT ?1",
+              "SELECT timestamp, request, tool, backend, outcome, http_status, duration_ms
+               FROM runtime_logs ORDER BY id DESC LIMIT ?1",
         )?;
-        let rows = statement.query_map([limit.min(1000) as i64], |row| {
+           let rows = statement.query_map([limit.min(self.runtime_log_limit).min(i64::MAX as usize) as i64], |row| {
             Ok(RuntimeLogEntry {
                 timestamp: row.get(0)?,
                 request: row.get(1)?,

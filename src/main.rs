@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::Html,
     routing::{get, post},
@@ -39,6 +39,11 @@ pub struct DashboardStatus {
     pub transport: String,
     pub current_spec_name: String,
     pub api_base_url: String,
+    pub requests_per_minute: usize,
+    pub backend_timeout_seconds: u64,
+    pub max_request_body_bytes: usize,
+    pub saved_specs_limit: usize,
+    pub runtime_log_limit: usize,
     pub tool_count: usize,
     pub risk_counts: serde_json::Value,
     pub health: bool,
@@ -85,7 +90,8 @@ pub struct GatewayService {
 
 impl GatewayService {
     pub fn from_registry(registry: ToolRegistry, config: GatewayConfig) -> Self {
-        Self::from_registry_with_http_client(registry, config, HttpClient::from_env())
+        let http_client = HttpClient::from_env_with_timeout(config.backend_timeout);
+        Self::from_registry_with_http_client(registry, config, http_client)
     }
 
     pub fn from_registry_with_http_client(
@@ -93,7 +99,8 @@ impl GatewayService {
         config: GatewayConfig,
         http_client: HttpClient,
     ) -> Self {
-        let store = SqliteStore::open_default().expect("SQLite database must be available");
+        let store = SqliteStore::open_default(config.saved_specs_limit, config.runtime_log_limit)
+            .expect("SQLite database must be available");
         Self::from_registry_with_http_client_and_store(registry, config, http_client, store)
     }
 
@@ -317,6 +324,11 @@ impl GatewayService {
             transport: config.transport.to_string(),
             current_spec_name: self.current_spec_name.read().expect("current spec name lock poisoned").clone(),
             api_base_url: self.http_client.base_url(),
+            requests_per_minute: config.requests_per_minute,
+            backend_timeout_seconds: config.backend_timeout.as_secs(),
+            max_request_body_bytes: config.max_request_body_bytes,
+            saved_specs_limit: config.saved_specs_limit,
+            runtime_log_limit: config.runtime_log_limit,
             tool_count,
             risk_counts: serde_json::Value::Object(risk_counts),
             health: true,
@@ -679,7 +691,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
     };
 
     Html(format!(
-        r#"
+        r###"
         <!doctype html>
         <html lang="en">
           <head>
@@ -697,6 +709,20 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
               .label {{ color: var(--muted); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }}
               .value {{ font-size: 2rem; font-weight: 700; margin-top: 10px; }}
               .panel {{ background: rgba(17,24,39,.9); border: 1px solid var(--line); border-radius: 16px; padding: 22px; }}
+              .intro {{ color: var(--muted); font-size: 1rem; line-height: 1.55; margin: 10px 0 22px; max-width: 760px; }}
+              .steps {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 0 0 24px; }}
+              .step {{ display: flex; align-items: center; gap: 12px; padding: 14px 16px; background: rgba(17,24,39,.82); border: 1px solid var(--line); border-radius: 14px; }}
+              .step-number {{ display: grid; place-items: center; flex: 0 0 30px; height: 30px; border-radius: 50%; background: rgba(56,189,248,.15); color: var(--accent); font-weight: 800; }}
+              .step a {{ color: var(--text); text-decoration: none; font-weight: 700; }}
+              .step a:hover {{ color: var(--accent); }}
+              details.panel {{ padding: 0; overflow: hidden; }}
+              details.panel > summary {{ cursor: pointer; list-style: none; padding: 18px 22px; font-size: 1.15rem; font-weight: 700; }}
+              details.panel > summary::-webkit-details-marker {{ display: none; }}
+              details.panel > summary::after {{ content: '+'; float: right; color: var(--accent); font-size: 1.4rem; line-height: 1; }}
+              details.panel[open] > summary::after {{ content: '−'; }}
+              .details-content {{ padding: 0 22px 22px; }}
+              .search-input {{ width: 100%; max-width: 440px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: rgba(15,23,42,.9); color: var(--text); }}
+              .table-wrap {{ overflow-x: auto; }}
               table {{ width: 100%; border-collapse: collapse; margin-top: 12px; }}
               th, td {{ text-align: left; padding: 12px 10px; border-bottom: 1px solid var(--line); }}
               th {{ color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }}
@@ -714,7 +740,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
               ul {{ list-style: none; padding: 0; margin: 12px 0 0; }}
               li {{ color: var(--text); }}
               pre {{ white-space: pre; word-break: normal; background: rgba(15,23,42,.9); border: 1px solid var(--line); border-radius: 12px; padding: 16px; color: var(--text); overflow: auto; margin-top: 16px; min-height: 180px; max-height: 420px; }}
-              @media (max-width: 640px) {{ .topbar {{ flex-direction: column; align-items: flex-start; gap: 12px; }} }}
+              @media (max-width: 640px) {{ .topbar {{ flex-direction: column; align-items: flex-start; gap: 12px; }} .steps {{ grid-template-columns: 1fr; }} .shell {{ padding: 24px 14px 40px; }} }}
             </style>
           </head>
           <body>
@@ -722,10 +748,17 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
               <div class="topbar">
                 <div>
                   <div class="badge">REST2MCP</div>
-                  <h1 style="margin: 12px 0 0;">Gateway Operations Dashboard</h1>
+                  <h1 style="margin: 12px 0 0;">API Gateway</h1>
                 </div>
                 <div class="badge" id="transportBadge">{}</div>
               </div>
+
+                            <p class="intro">Turn an API description into callable tools. Start by loading a spec, then choose a tool and test it against its backend.</p>
+                            <nav class="steps" aria-label="Getting started">
+                                <div class="step"><span class="step-number">1</span><a href="#spec-loader">Load an API</a></div>
+                                <div class="step"><span class="step-number">2</span><a href="#manual-tester">Test a tool</a></div>
+                                <div class="step"><span class="step-number">3</span><a href="#request-logs">Review activity</a></div>
+                            </nav>
 
               <div class="grid">
                 <div class="card">
@@ -755,27 +788,28 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                                 </div>
               </div>
 
-              <div class="panel">
+                            <details class="panel" style="margin-bottom:24px;">
+                                <summary>Gateway access settings</summary>
+                                <div class="details-content">
                 <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
-                  <h2 style="margin:0;">Runtime Controls</h2>
+                                    <h2 style="margin:0;">Gateway Access</h2>
                   <span class="meta" id="updatedAt">Updated: {}</span>
                 </div>
-                <div class="controls">
-                  <button class="primary" data-mode="streamable-http">Streamable HTTP</button>
-                  <button class="secondary" data-mode="stdio">Stdio</button>
-                </div>
+                                <p class="meta" id="gatewayLimitsSummary">Runtime limits are loaded from environment configuration at startup.</p>
                                 <div style="margin-top:16px;">
-                                    <label class="meta" for="dashboardAuthToken">Gateway bearer token (kept for this browser session only)</label>
+                                                                        <label class="meta" for="dashboardAuthToken">Bearer token (stored for this browser tab only)</label>
                                     <div class="controls" style="margin-top:8px;">
                                         <input id="dashboardAuthToken" type="password" autocomplete="off" placeholder="Optional for local-only use" style="flex:1; min-width:240px; padding:10px 12px; border-radius:10px; border:1px solid var(--line); background:rgba(15,23,42,.9); color:var(--text);" />
                                         <button class="secondary" id="saveDashboardTokenBtn" type="button">Use token</button>
                                     </div>
-                                    <div class="meta" id="dashboardTokenStatus">Without a configured server token, HTTP access is read-only.</div>
+                                    <div class="meta" id="dashboardTokenStatus">Only needed when the gateway was started with REST2MCP_AUTH_TOKEN.</div>
                                 </div>
-              </div>
+                                </div>
+                            </details>
 
-              <div class="panel" style="margin-top: 24px;">
-                <h2 style="margin: 0 0 8px;">OpenAPI Spec Loader</h2>
+                            <div class="panel" id="spec-loader" style="margin-top: 24px;">
+                                <h2 style="margin: 0 0 8px;">1. Load an API</h2>
+                                <p class="meta">Choose an OpenAPI/Swagger file or paste JSON/YAML. The server details in the spec are used for API calls.</p>
                 <label class="meta" for="specFile">Select a spec file (.json / .yaml / .yml)</label>
                 <input id="specFile" type="file" accept=".json,.yaml,.yml" />
                 <textarea id="specInput" placeholder="Paste OpenAPI JSON or YAML here..."></textarea>
@@ -790,16 +824,38 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                 </div>
               </div>
 
-              <div class="panel" style="margin-top: 24px;">
-                <h2 style="margin: 0 0 8px;">Saved Specs</h2>
+                            <div class="panel" id="manual-tester" style="margin-top: 24px;">
+                                <h2 style="margin: 0 0 8px;">2. Test a tool</h2>
+                                <div class="meta">Choose an operation, create an example request, edit it if needed, then send it to the API.</div>
+                                <label class="meta" for="testToolSelect">API operation</label>
+                                <select id="testToolSelect"></select>
+                                <label class="meta" for="mcpRequestInput" style="display:block; margin-top:16px;">Request JSON (editable)</label>
+                                <textarea id="mcpRequestInput" spellcheck="false" style="min-height: 180px;"></textarea>
+                                <div class="controls">
+                                    <button class="secondary" id="prepareToolCallBtn" type="button">Create example request</button>
+                                    <button class="primary" id="sendMcpRequestBtn" type="button">Send request</button>
+                                    <button class="success" id="approvePendingBtn" type="button" hidden>Approve pending action</button>
+                                </div>
+                                <div class="status-box" id="mcpTestStatus" role="status">Select an API operation to get started.</div>
+                                <h3 style="margin-bottom:8px;">Response</h3>
+                                <pre id="mcpTestResponse">No request sent yet.</pre>
+                            </div>
+
+                            <details class="panel" style="margin-top: 16px;">
+                                <summary>Saved APIs</summary>
+                                <div class="details-content">
                 <ul>
                   {}
                 </ul>
-              </div>
+                                </div>
+                            </details>
 
-              <div class="panel" style="margin-top: 24px;">
-                <h2 style="margin: 0 0 8px;">Generated Tools</h2>
-                <table>
+                            <details class="panel" style="margin-top: 16px;">
+                                <summary>Tool catalog</summary>
+                                <div class="details-content">
+                                <p class="meta">Browse generated operations; select a tool in the tester to prepare its request.</p>
+                                <input class="search-input" id="toolSearch" type="search" placeholder="Filter by name, method, or path…" aria-label="Filter tools" />
+                                <div class="table-wrap"><table>
                   <thead>
                     <tr>
                       <th>Name</th>
@@ -813,37 +869,23 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                   <tbody>
                     {}
                   </tbody>
-                </table>
-              </div>
+                                </table></div>
+                                </div>
+                            </details>
 
-              <div class="panel" style="margin-top: 24px;">
-                <h2 style="margin: 0 0 8px;">Selected MCP Schema</h2>
+                            <details class="panel" style="margin-top: 16px;">
+                                <summary>Tool schema</summary>
+                                <div class="details-content">
                 <div class="meta" id="selectedToolMeta">Select a tool to inspect input/output schema.</div>
                 <pre id="selectedToolSchema">{}</pre>
-              </div>
-
-                            <div class="panel" style="margin-top: 24px;">
-                                <h2 style="margin: 0 0 8px;">Manual MCP Tester</h2>
-                                <div class="meta">Generate editable dummy inputs from the OpenAPI schema, then send JSON-RPC requests to this gateway's <code>/mcp</code> endpoint.</div>
-                                <label class="meta" for="testToolSelect">Tool for a quick call</label>
-                                <select id="testToolSelect"></select>
-                                <label class="meta" for="mcpRequestInput" style="display:block; margin-top:16px;">JSON-RPC request (editable)</label>
-                                <textarea id="mcpRequestInput" spellcheck="false" style="min-height: 180px;"></textarea>
-                                <div class="controls">
-                                    <button class="secondary" id="listToolsBtn" type="button">Test tools/list</button>
-                                    <button class="secondary" id="prepareToolCallBtn" type="button">Generate dummy request</button>
-                                    <button class="primary" id="sendMcpRequestBtn" type="button">Send request</button>
-                                    <button class="success" id="approvePendingBtn" type="button" disabled>Approve pending action</button>
                                 </div>
-                                <div class="status-box" id="mcpTestStatus" role="status">Ready. Select a tool or test tools/list.</div>
-                                <h3 style="margin-bottom:8px;">Response</h3>
-                                <pre id="mcpTestResponse">No request sent yet.</pre>
-                            </div>
+                            </details>
 
-                            <div class="panel" style="margin-top: 24px;">
+                            <details class="panel" id="request-logs" style="margin-top: 24px;">
+                                <summary>3. Recent activity</summary>
+                                <div class="details-content">
                                 <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
                                     <div>
-                                        <h2 style="margin: 0 0 8px;">Recent Request Logs</h2>
                                         <div class="meta">Latest 100 MCP requests. Payloads and response bodies are intentionally excluded.</div>
                                     </div>
                                     <div style="display:flex; gap:8px;">
@@ -859,7 +901,8 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                                         <tbody id="runtimeLogsBody"><tr><td colspan="7" class="meta">No requests logged yet.</td></tr></tbody>
                                     </table>
                                 </div>
-                            </div>
+                                </div>
+                            </details>
             </div>
 
                         <script>
@@ -891,6 +934,8 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                 document.getElementById('updatedAt').textContent = 'Updated: ' + payload.last_updated;
                 document.getElementById('activeSchemaValue').textContent = payload.current_spec_name;
                 document.getElementById('activeApiUrl').textContent = payload.api_base_url;
+                                document.getElementById('gatewayLimitsSummary').textContent =
+                                    payload.requests_per_minute + ' requests/min · backend timeout ' + payload.backend_timeout_seconds + 's · max request ' + Math.round(payload.max_request_body_bytes / 1024) + ' KB · keep ' + payload.saved_specs_limit + ' APIs / ' + payload.runtime_log_limit + ' logs';
               }};
 
               const showToolSchema = (name) => {{
@@ -898,6 +943,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                 if (!tool) {{
                   return;
                 }}
+                                document.getElementById('selectedToolSchema').closest('details').open = true;
                 document.getElementById('selectedToolMeta').textContent = tool.method + ' ' + tool.path + ' · ' + tool.risk;
                 document.getElementById('selectedToolSchema').textContent = JSON.stringify({{
                   name: tool.name,
@@ -994,7 +1040,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                                     try {{ payload = JSON.parse(text); }} catch (_) {{ payload = text || '(empty response body)'; }}
                                     output.textContent = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
                                     const approvalToken = payload && payload.result && payload.result.approval_token;
-                                    document.getElementById('approvePendingBtn').disabled = !approvalToken;
+                                    document.getElementById('approvePendingBtn').hidden = !approvalToken;
                                     status.textContent = 'HTTP ' + response.status + (response.ok ? ' · request completed' : ' · request failed');
                                     status.style.color = response.ok ? '#a7f3d0' : '#fca5a5';
                                 }} catch (err) {{
@@ -1011,10 +1057,6 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                                 option.textContent = tool.name + ' · ' + tool.method + ' ' + tool.path;
                                 testToolSelect.appendChild(option);
                             }});
-                            document.getElementById('listToolsBtn').addEventListener('click', () => {{
-                                setMcpRequest({{ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {{}} }});
-                                sendMcpRequest();
-                            }});
                             document.getElementById('prepareToolCallBtn').addEventListener('click', prepareSelectedToolCall);
                             document.getElementById('sendMcpRequestBtn').addEventListener('click', sendMcpRequest);
                             document.getElementById('approvePendingBtn').addEventListener('click', () => {{
@@ -1024,7 +1066,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                                 if (!approvalToken) return;
                                 if (!window.confirm('Approve and execute ' + previousResponse.result.tool + ' at ' + previousResponse.result.method + ' ' + previousResponse.result.path + '?')) return;
                                 setMcpRequest({{ jsonrpc: '2.0', id: 2, method: 'tools/approve', params: {{ approval_token: approvalToken }} }});
-                                document.getElementById('approvePendingBtn').disabled = true;
+                                document.getElementById('approvePendingBtn').hidden = true;
                                 sendMcpRequest();
                             }});
                             testToolSelect.addEventListener('change', prepareSelectedToolCall);
@@ -1083,6 +1125,12 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                                 }}
                             }};
                             document.getElementById('refreshLogsBtn').addEventListener('click', refreshLogs);
+                            document.getElementById('toolSearch').addEventListener('input', (event) => {{
+                                const query = event.target.value.trim().toLowerCase();
+                                document.querySelectorAll('tbody tr[data-tool-name]').forEach((row) => {{
+                                    row.hidden = !row.textContent.toLowerCase().includes(query);
+                                }});
+                            }});
                             document.getElementById('clearLogsBtn').addEventListener('click', async () => {{
                                 if (!window.confirm('Permanently clear all stored request logs?')) return;
                                 const response = await apiFetch('/ui/logs/clear', {{ method: 'POST' }});
@@ -1209,11 +1257,11 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                 }});
               }});
 
-              const firstTool = Object.keys(toolSchemas)[0];
+              const firstTool = toolSchemaEntries.find((tool) => tool.method === 'GET')?.name || Object.keys(toolSchemas)[0];
               if (firstTool) {{
-                showToolSchema(firstTool);
                                 testToolSelect.value = firstTool;
                                 prepareSelectedToolCall();
+                                document.getElementById('mcpTestStatus').textContent = 'Example request ready. Review its arguments, then send it to the API.';
               }}
 
               refresh();
@@ -1223,7 +1271,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
             </script>
           </body>
         </html>
-        "#,
+        "###,
         status.transport,
         if status.health { "Healthy" } else { "Degraded" },
         status.tool_count,
@@ -1533,7 +1581,9 @@ async fn main() {
             .route("/", get(ui_page));
     }
 
-    let app = app.with_state(service);
+    let app = app
+        .layer(DefaultBodyLimit::max(config.max_request_body_bytes))
+        .with_state(service);
 
     let listener = TcpListener::bind(&config.http_bind)
         .await
@@ -1557,7 +1607,7 @@ mod tests {
     use crate::mcp::ToolRegistry;
     use crate::openapi::build_registry;
     use crate::security::{CallerContext, Persona, SecurityGuard};
-    use crate::storage::SqliteStore;
+    use crate::storage::{RuntimeLogEntry, SqliteStore, StoredSpec};
     use crate::GatewayService;
 
     #[test]
@@ -1813,12 +1863,46 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_retention_limits_are_configurable() {
+        let store = SqliteStore::open_with_limits(":memory:", 1, 2).unwrap();
+        for index in 1..=3 {
+            store.save_spec(&StoredSpec {
+                name: format!("api-{index}"),
+                raw: "{\"openapi\":\"3.1.0\",\"paths\":{}}".to_string(),
+                tool_count: 0,
+                version: "1".to_string(),
+                updated_at: format!("2026-01-0{index}T00:00:00Z"),
+                api_base_url: "http://localhost".to_string(),
+            }).unwrap();
+        }
+        assert_eq!(store.list_specs().unwrap().len(), 1);
+
+        for index in 0..3 {
+            store.add_log(&RuntimeLogEntry {
+                timestamp: format!("2026-01-0{}T00:00:00Z", index + 1),
+                request: "tools/list".to_string(),
+                tool: "-".to_string(),
+                backend: "-".to_string(),
+                outcome: "success".to_string(),
+                http_status: None,
+                duration_ms: 0,
+            }).unwrap();
+        }
+        assert_eq!(store.recent_logs(100).unwrap().len(), 2);
+    }
+
+    #[test]
     fn loads_gateway_config_from_environment() {
         unsafe {
             env::set_var("REST2MCP_BIND", "127.0.0.1:9090");
             env::set_var("REST2MCP_TRANSPORT", "stdio");
             env::set_var("REST2MCP_LOG_TO_STDERR", "false");
             env::set_var("REST2MCP_ENABLE_UI", "true");
+            env::set_var("REST2MCP_BACKEND_TIMEOUT_SECS", "45");
+            env::set_var("REST2MCP_MAX_REQUEST_BODY_BYTES", "4096");
+            env::set_var("REST2MCP_SAVED_SPECS_LIMIT", "25");
+            env::set_var("REST2MCP_RUNTIME_LOG_LIMIT", "2500");
+            env::set_var("REST2MCP_REQUESTS_PER_MINUTE", "75");
         }
 
         let config = GatewayConfig::from_env();
@@ -1827,12 +1911,22 @@ mod tests {
         assert!(!config.log_to_stderr);
         assert_eq!(config.transport.to_string(), "stdio");
         assert!(config.ui_enabled);
+        assert_eq!(config.backend_timeout.as_secs(), 45);
+        assert_eq!(config.max_request_body_bytes, 4096);
+        assert_eq!(config.saved_specs_limit, 25);
+        assert_eq!(config.runtime_log_limit, 2500);
+        assert_eq!(config.requests_per_minute, 75);
 
         unsafe {
             env::remove_var("REST2MCP_BIND");
             env::remove_var("REST2MCP_TRANSPORT");
             env::remove_var("REST2MCP_LOG_TO_STDERR");
             env::remove_var("REST2MCP_ENABLE_UI");
+            env::remove_var("REST2MCP_BACKEND_TIMEOUT_SECS");
+            env::remove_var("REST2MCP_MAX_REQUEST_BODY_BYTES");
+            env::remove_var("REST2MCP_SAVED_SPECS_LIMIT");
+            env::remove_var("REST2MCP_RUNTIME_LOG_LIMIT");
+            env::remove_var("REST2MCP_REQUESTS_PER_MINUTE");
         }
     }
 

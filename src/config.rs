@@ -1,4 +1,5 @@
 use std::{env, fmt, str::FromStr};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +49,10 @@ pub struct GatewayConfig {
     pub auth: AuthConfig,
     pub ui_enabled: bool,
     pub requests_per_minute: usize,
+    pub backend_timeout: Duration,
+    pub max_request_body_bytes: usize,
+    pub saved_specs_limit: usize,
+    pub runtime_log_limit: usize,
 }
 
 impl GatewayConfig {
@@ -94,6 +99,11 @@ impl GatewayConfig {
             .filter(|value| *value > 0)
             .unwrap_or(120);
 
+        let backend_timeout_secs = positive_env_usize("REST2MCP_BACKEND_TIMEOUT_SECS", 30, 300);
+        let max_request_body_bytes = positive_env_usize("REST2MCP_MAX_REQUEST_BODY_BYTES", 2 * 1024 * 1024, 64 * 1024 * 1024);
+        let saved_specs_limit = positive_env_usize("REST2MCP_SAVED_SPECS_LIMIT", 10, 1000);
+        let runtime_log_limit = positive_env_usize("REST2MCP_RUNTIME_LOG_LIMIT", 1000, 1_000_000);
+
         Self {
             transport,
             http_bind,
@@ -101,6 +111,10 @@ impl GatewayConfig {
             auth,
             ui_enabled,
             requests_per_minute,
+            backend_timeout: Duration::from_secs(backend_timeout_secs as u64),
+            max_request_body_bytes,
+            saved_specs_limit,
+            runtime_log_limit,
         }
     }
 
@@ -114,9 +128,27 @@ impl GatewayConfig {
         if !bind.ip().is_loopback() && self.auth.bearer_token.is_none() {
             return Err("REST2MCP_AUTH_TOKEN is required when REST2MCP_BIND is not loopback".to_string());
         }
+        if self.requests_per_minute == 0 {
+            return Err("REST2MCP_REQUESTS_PER_MINUTE must be greater than zero".to_string());
+        }
+        if self.backend_timeout.is_zero() {
+            return Err("REST2MCP_BACKEND_TIMEOUT_SECS must be greater than zero".to_string());
+        }
+        if self.max_request_body_bytes == 0 || self.saved_specs_limit == 0 || self.runtime_log_limit == 0 {
+            return Err("request size and SQLite retention limits must be greater than zero".to_string());
+        }
 
         Ok(())
     }
+}
+
+fn positive_env_usize(name: &str, default: usize, maximum: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+        .min(maximum)
 }
 
 impl Default for GatewayConfig {
@@ -134,6 +166,10 @@ impl Default for GatewayConfig {
             },
             ui_enabled: true,
             requests_per_minute: 120,
+            backend_timeout: Duration::from_secs(30),
+            max_request_body_bytes: 2 * 1024 * 1024,
+            saved_specs_limit: 10,
+            runtime_log_limit: 1000,
         }
     }
 }

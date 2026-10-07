@@ -78,6 +78,10 @@ Configuration is read from environment variables before startup:
 | `REST2MCP_AUTH_TOKEN` | Static gateway bearer token; required for non-loopback binds | unset |
 | `REST2MCP_AUTH_SCOPES` | Comma-separated scopes assigned to the configured token | `read:resources` |
 | `REST2MCP_REQUESTS_PER_MINUTE` | Process-wide MCP request limit | `120` |
+| `REST2MCP_BACKEND_TIMEOUT_SECS` | Timeout for each backend HTTP request | `30` seconds |
+| `REST2MCP_MAX_REQUEST_BODY_BYTES` | Maximum inbound HTTP request size | `2097152` (2 MiB) |
+| `REST2MCP_SAVED_SPECS_LIMIT` | Maximum number of saved OpenAPI documents | `10` |
+| `REST2MCP_RUNTIME_LOG_LIMIT` | Maximum persisted request log entries | `1000` |
 | `REST2MCP_BACKEND_BEARER_TOKEN` | Credential injected into backend HTTP requests | unset |
 | `REST2MCP_LOG_TO_STDERR` | Route tracing logs to stderr | `true` |
 

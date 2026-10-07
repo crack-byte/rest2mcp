@@ -150,6 +150,10 @@ To reset locally saved data, stop the gateway and remove the SQLite database fil
 | `REST2MCP_AUTH_TOKEN` | Static gateway bearer token; mandatory for remote bind | unset |
 | `REST2MCP_AUTH_SCOPES` | Scopes granted to gateway token | `read:resources` |
 | `REST2MCP_REQUESTS_PER_MINUTE` | Process-wide MCP request limit | `120` |
+| `REST2MCP_BACKEND_TIMEOUT_SECS` | Backend request timeout; maximum 300 seconds | `30` |
+| `REST2MCP_MAX_REQUEST_BODY_BYTES` | Inbound HTTP request limit; maximum 64 MiB | `2097152` (2 MiB) |
+| `REST2MCP_SAVED_SPECS_LIMIT` | Number of saved specs retained; maximum 1,000 | `10` |
+| `REST2MCP_RUNTIME_LOG_LIMIT` | Number of log entries retained; maximum 1,000,000 | `1000` |
 | `REST2MCP_BACKEND_BEARER_TOKEN` | Backend bearer credential | unset |
 | `REST2MCP_LOG_TO_STDERR` | Route tracing logs to stderr | `true` |
 | `REST2MCP_DUAL_PERSONA` | Reserved auth configuration flag | `true` |
