@@ -1,4 +1,5 @@
 mod config;
+mod http_client;
 mod mcp;
 mod openapi;
 mod security;
@@ -23,6 +24,7 @@ use tokio::{
 use tracing_subscriber::{fmt, EnvFilter};
 
 use crate::config::GatewayConfig;
+use crate::http_client::HttpClient;
 use crate::mcp::{McpRequest, McpResponse, ToolDefinition, ToolRegistry};
 use crate::openapi::build_registry;
 use crate::security::{AuditEntry, CallerContext, Persona, SecurityGuard};
@@ -78,16 +80,26 @@ pub struct GatewayService {
     config: Arc<RwLock<GatewayConfig>>,
     saved_specs: Arc<RwLock<Vec<StoredSpec>>>,
     current_spec_name: Arc<RwLock<String>>,
+    http_client: Arc<HttpClient>,
 }
 
 impl GatewayService {
     pub fn from_registry(registry: ToolRegistry, config: GatewayConfig) -> Self {
+        Self::from_registry_with_http_client(registry, config, HttpClient::from_env())
+    }
+
+    pub fn from_registry_with_http_client(
+        registry: ToolRegistry,
+        config: GatewayConfig,
+        http_client: HttpClient,
+    ) -> Self {
         Self {
             registry: Arc::new(RwLock::new(registry)),
             security: Arc::new(SecurityGuard::default()),
             config: Arc::new(RwLock::new(config)),
             saved_specs: Arc::new(RwLock::new(Vec::new())),
             current_spec_name: Arc::new(RwLock::new("sample".to_string())),
+            http_client: Arc::new(http_client),
         }
     }
 
@@ -244,7 +256,7 @@ impl GatewayService {
             .list_for_caller(caller)
     }
 
-    pub fn handle_request(&self, request: &McpRequest, caller: &CallerContext) -> Result<McpResponse, String> {
+    pub async fn handle_request(&self, request: &McpRequest, caller: &CallerContext) -> Result<McpResponse, String> {
         let fragmentation_check = vec![
             request.method.clone(),
             request.id.to_string(),
@@ -298,7 +310,25 @@ impl GatewayService {
                     };
                     self.security.audit_write(&audit);
                     tracing::info!(token = %approval.token, tool = %tool_name, "destructive MCP action pending approval");
+                    return Ok(McpResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id: request.id.clone(),
+                        result: json!({
+                            "tool": tool.name,
+                            "path": tool.path,
+                            "method": tool.method,
+                            "risk": format!("{:?}", tool.risk),
+                            "status": "approval_required",
+                            "approval_token": approval.token,
+                        }),
+                    });
                 }
+
+                let backend_response = self
+                    .http_client
+                    .execute(&tool, &params)
+                    .await
+                    .map_err(|err| format!("backend execution failed for '{tool_name}': {err}"))?;
 
                 Ok(McpResponse {
                     jsonrpc: "2.0".to_string(),
@@ -308,7 +338,8 @@ impl GatewayService {
                         "path": tool.path,
                         "method": tool.method,
                         "risk": format!("{:?}", tool.risk),
-                        "status": "routed"
+                        "status": "executed",
+                        "http_response": backend_response,
                     }),
                 })
             }
@@ -519,7 +550,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
 
                         <script>
                             const toolSchemas = {{}};
-                            const toolSchemaEntries = JSON.parse({9});
+                            const toolSchemaEntries = {};
                             toolSchemaEntries.forEach((tool) => {{
                                 toolSchemas[tool.name] = tool;
                             }});
@@ -587,7 +618,7 @@ async fn ui_page(State(state): State<GatewayService>) -> Html<String> {
                 window.location.reload();
               }};
 
-              document.querySelectorAll('[data-tool-name]').forEach((button) => {{
+              document.querySelectorAll('button[data-tool-name]').forEach((button) => {{
                 button.addEventListener('click', () => {{
                   const toolName = button.getAttribute('data-tool-name');
                   showToolSchema(toolName);
@@ -791,7 +822,7 @@ async fn handle_mcp(
         ],
     };
 
-    let response = match state.handle_request(&payload, &caller) {
+    let response = match state.handle_request(&payload, &caller).await {
         Ok(response) => response,
         Err(err) => {
             let status = if err.contains("not found") {
@@ -834,7 +865,7 @@ async fn run_stdio_transport(service: GatewayService) -> Result<(), Box<dyn std:
             scopes: vec!["read:resources".to_string(), "write:resources".to_string()],
         };
 
-        let payload = match service.handle_request(&request, &caller) {
+        let payload = match service.handle_request(&request, &caller).await {
             Ok(response) => serde_json::to_string(&response)?,
             Err(err) => serde_json::json!({
                 "jsonrpc": "2.0",
@@ -1047,5 +1078,70 @@ mod tests {
             .list()
             .iter()
             .any(|tool| tool.name == "get_orders"));
+    }
+
+    #[tokio::test]
+    async fn executes_tool_calls_against_a_real_backend() {
+        use crate::GatewayService;
+        use crate::http_client::HttpClient;
+        use axum::{routing::get, Json, Router};
+
+        let app = Router::new().route(
+            "/invoices/{id}",
+            get(|axum::extract::Path(id): axum::extract::Path<String>| async move {
+                Json(json!({ "id": id, "status": "ok" }))
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have an address");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("backend http server should run");
+        });
+
+        let registry = ToolRegistry::from_openapi(&json!({
+            "openapi": "3.1.0",
+            "info": { "title": "Invoices API", "version": "1.0.0" },
+            "paths": {
+                "/invoices/{id}": {
+                    "get": {
+                        "summary": "Fetch invoice",
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                }
+            }
+        })).expect("spec should parse");
+
+        let service = GatewayService::from_registry_with_http_client(
+            registry,
+            GatewayConfig::default(),
+            HttpClient::new(format!("http://{addr}")),
+        );
+
+        let request = crate::mcp::McpRequest {
+            jsonrpc: "2.0".to_string(),
+            id: json!(1),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "get_invoices_id",
+                "id": "42"
+            })),
+        };
+
+        let caller = CallerContext {
+            persona: Persona::Human,
+            subject: "alice@example.com".to_string(),
+            scopes: vec!["read:resources".to_string()],
+        };
+
+        let response = service.handle_request(&request, &caller).await.expect("tool call should succeed");
+        let body = response.result.get("http_response").and_then(|value| value.get("body")).expect("backend body should be present");
+
+        assert_eq!(response.result.get("status").and_then(|value| value.as_str()), Some("executed"));
+        assert_eq!(body.get("id").and_then(|value| value.as_str()), Some("42"));
+        assert_eq!(body.get("status").and_then(|value| value.as_str()), Some("ok"));
     }
 }
